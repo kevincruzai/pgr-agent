@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
-import { all, get, run } from '../db.js';
+import { all, withTransaction } from '../db.js';
+import { encryptEmailsDeep } from './fieldCrypto.js';
 
 /*
  * Bitácora de auditoría (DL 113/2024 — registro de acciones del sistema).
@@ -9,8 +10,10 @@ import { all, get, run } from '../db.js';
  *   descarga de documentos).
  * - Integridad: hash SHA-256 encadenado (row_hash = H(prev_hash | payload)).
  *   Alterar o borrar una fila intermedia rompe la cadena → detectable.
- * - Las escrituras se serializan en una cola para preservar el encadenado;
- *   nunca interrumpen la petición del usuario (fallos solo se loguean).
+ * - El encadenado es seguro entre procesos: cada escritura lee el último hash
+ *   dentro de una transacción SERIALIZABLE con UPDLOCK+HOLDLOCK, de modo que
+ *   varias instancias del backend sobre la misma base no rompen la cadena.
+ *   Las escrituras nunca interrumpen la petición del usuario (fallos se loguean).
  * - Saneo: contraseñas, claves de API y tokens jamás se escriben.
  */
 
@@ -43,14 +46,12 @@ function rowPayload(r) {
   ]);
 }
 
+/* Cola en proceso: evita que las escrituras de esta instancia compitan entre sí
+   (reduce contención sobre el lock). La corrección frente a OTRAS instancias la
+   garantiza la transacción de writeEvent, no esta cola. */
 let queue = Promise.resolve();
-let lastHash = null; // se inicializa de forma diferida desde la BD
 
 async function writeEvent(evt) {
-  if (lastHash === null) {
-    const last = await get('SELECT TOP 1 row_hash FROM audit_log ORDER BY id DESC');
-    lastHash = last?.row_hash || 'GENESIS';
-  }
   const row = {
     event_time_iso: new Date().toISOString(),
     user_id: evt.userId ?? null,
@@ -59,18 +60,26 @@ async function writeEvent(evt) {
     action: String(evt.action || '').slice(0, 115),
     entity: String(evt.entity || '').slice(0, 55),
     entity_id: evt.entityId != null ? String(evt.entityId).slice(0, 55) : null,
-    details: JSON.stringify(sanitize(evt.details ?? {})).slice(0, 4000),
+    // Se cifran los correos dentro del detalle: la bitácora queda cifrada en
+    // reposo y solo se descifra para el auditor autorizado al consultarla.
+    details: JSON.stringify(encryptEmailsDeep(sanitize(evt.details ?? {}))).slice(0, 8000),
     success: evt.success !== false,
     ip: String(evt.ip || '').slice(0, 55),
     user_agent: String(evt.userAgent || '').slice(0, 290),
   };
-  const prev = lastHash;
-  const hash = computeHash(prev, rowPayload(row));
-  await run(`INSERT INTO audit_log(event_time_iso,user_id,user_name,impersonated_by,action,entity,entity_id,details,success,ip,user_agent,prev_hash,row_hash)
-    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-    [row.event_time_iso, row.user_id, row.user_name, row.impersonated_by, row.action, row.entity,
-     row.entity_id, row.details, row.success ? 1 : 0, row.ip, row.user_agent, prev, hash]);
-  lastHash = hash;
+  /* El hash previo se lee DENTRO de la transacción, con UPDLOCK+HOLDLOCK sobre la
+     última fila: cualquier otra instancia que intente escribir a la vez espera aquí.
+     Antes se cacheaba en memoria del proceso, lo que rompía la cadena cuando había
+     más de un backend escribiendo sobre la misma base. */
+  await withTransaction(async ({ get: txGet, run: txRun }) => {
+    const last = await txGet('SELECT TOP 1 row_hash FROM audit_log WITH (UPDLOCK, HOLDLOCK) ORDER BY id DESC');
+    const prev = last?.row_hash || 'GENESIS';
+    const hash = computeHash(prev, rowPayload(row));
+    await txRun(`INSERT INTO audit_log(event_time_iso,user_id,user_name,impersonated_by,action,entity,entity_id,details,success,ip,user_agent,prev_hash,row_hash)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      [row.event_time_iso, row.user_id, row.user_name, row.impersonated_by, row.action, row.entity,
+       row.entity_id, row.details, row.success ? 1 : 0, row.ip, row.user_agent, prev, hash]);
+  });
 }
 
 /** Registra un evento. Nunca lanza: la auditoría no debe romper la operación. */

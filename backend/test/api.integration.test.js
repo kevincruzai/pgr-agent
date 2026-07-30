@@ -10,6 +10,7 @@ import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { createApp } from '../src/app.js';
 import { run, get, closePool } from '../src/db.js';
+import { buildUserContext } from '../src/routes/assistant.routes.js';
 
 const MARK = 'TEST-AUDIT';
 const TEST_DOC = '99000000-1';
@@ -252,6 +253,57 @@ test('correspondencia: lista de adjuntos disponible (vacía para correo interno)
   const r = await api('GET', `/correspondences/${corrId}/attachments`, { token: jefeToken });
   assert.equal(r.status, 200);
   assert.deepEqual(r.json.data, []);
+});
+
+/* ─── 5b. Asistente IA global: aislamiento de datos por usuario ─── */
+test('asistente: el contexto de un usuario no incluye proyectos ni correos de otro', async () => {
+  const solicitante = await get('SELECT id, name, role, unit_id FROM users WHERE document_number=?', ['03456789-0']);
+  const jefe = await get('SELECT id, name, role, unit_id FROM users WHERE document_number=?', ['01234567-8']);
+
+  /* Proyecto creado por el solicitante, sin asignar al jefe */
+  const c = await api('POST', '/projects', { token: solicitanteToken, body: {
+    title: `${MARK} Proyecto privado`, description: 'Aislamiento del asistente', budget_estimated: 5000 } });
+  assert.equal(c.status, 200);
+  const pid = c.json.id;
+
+  const ctxSolicitante = await buildUserContext(solicitante);
+  const ctxJefe = await buildUserContext(jefe);
+
+  assert.ok(ctxSolicitante.mis_proyectos.some(p => p.id === pid), 'el creador debe ver su propio proyecto');
+  assert.ok(!ctxJefe.mis_proyectos.some(p => p.id === pid), 'un tercero NO debe ver el proyecto ajeno en su contexto');
+
+  /* Todo proyecto del contexto pertenece al usuario (creador o responsable) */
+  for (const p of ctxJefe.mis_proyectos) {
+    const r = await get('SELECT created_by, assigned_to FROM projects WHERE id=?', [p.id]);
+    assert.ok(r.created_by === jefe.id || r.assigned_to === jefe.id, `proyecto ajeno ${p.id} en el contexto del jefe`);
+  }
+  /* Todo correo del contexto pertenece al usuario (remitente o destinatario) */
+  for (const m of ctxJefe.mis_correos.mensajes) {
+    const r = await get('SELECT TOP 1 id FROM correspondences WHERE subject=? AND (to_user_id=? OR from_user_id=?)',
+      [m.asunto, jefe.id, jefe.id]);
+    assert.ok(r, `correo ajeno "${m.asunto}" en el contexto del jefe`);
+  }
+  /* Toda alerta del contexto va dirigida al usuario */
+  for (const a of ctxJefe.mis_alertas) {
+    const r = await get('SELECT TOP 1 id FROM alerts WHERE title=? AND user_id=?', [a.titulo, jefe.id]);
+    assert.ok(r, `alerta ajena "${a.titulo}" en el contexto del jefe`);
+  }
+  /* El presupuesto se expone como agregado institucional, no como dato personal */
+  assert.ok('presupuesto_institucional' in ctxJefe);
+  assert.ok('pac_institucional' in ctxJefe);
+});
+
+test('asistente: exige autenticación y valida la entrada', async () => {
+  assert.equal((await api('POST', '/assistant/chat', { body: { messages: [{ role: 'user', text: 'hola' }] } })).status, 401);
+  assert.equal((await api('GET', '/assistant/summary')).status, 401);
+
+  const vacio = await api('POST', '/assistant/chat', { token: jefeToken, body: { messages: [] } });
+  assert.equal(vacio.status, 400);
+
+  const s = await api('GET', '/assistant/summary', { token: jefeToken });
+  assert.equal(s.status, 200);
+  assert.equal(typeof s.json.data.correos_sin_leer, 'number');
+  assert.equal(typeof s.json.data.mis_proyectos, 'number');
 });
 
 /* ─── 6. PAC (Planificación Anual de Compras) ─── */

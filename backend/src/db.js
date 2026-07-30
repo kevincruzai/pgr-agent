@@ -1,5 +1,6 @@
 import { createRequire } from 'node:module';
 import { config } from './config.js';
+import { decryptRow } from './services/fieldCrypto.js';
 
 const require = createRequire(import.meta.url);
 // Autenticación Windows requiere el driver nativo msnodesqlv8 (ODBC);
@@ -51,9 +52,8 @@ export function getPool() {
   return poolPromise;
 }
 
-async function query(sqlText, params = []) {
-  const pool = await getPool();
-  const request = pool.request();
+/** Vincula los parámetros posicionales (?) a un request de mssql y ejecuta. */
+function runOnRequest(request, sqlText, params = []) {
   let i = 0;
   // Prefijo "prm" — el driver ODBC autogenera @P1,@P2... y colisionaría con @p1
   const text = sqlText.replace(/\?/g, () => `@prm${i++}`);
@@ -61,11 +61,55 @@ async function query(sqlText, params = []) {
   return request.query(text);
 }
 
-/** Devuelve todas las filas. */
-export const all = async (sqlText, params = []) => (await query(sqlText, params)).recordset ?? [];
+async function query(sqlText, params = []) {
+  const pool = await getPool();
+  return runOnRequest(pool.request(), sqlText, params);
+}
 
-/** Devuelve la primera fila o undefined. */
-export const get = async (sqlText, params = []) => ((await query(sqlText, params)).recordset ?? [])[0];
+/**
+ * Ejecuta `fn` dentro de una transacción SERIALIZABLE.
+ *
+ * `fn` recibe helpers {all, get, run} ligados a la transacción, con la misma
+ * firma que los de módulo. Se usa donde la corrección depende de leer y escribir
+ * de forma atómica frente a OTROS PROCESOS (por ejemplo, el encadenado de hash
+ * de la bitácora, que antes se serializaba solo dentro de un proceso).
+ * Hace rollback y relanza si `fn` falla.
+ */
+export async function withTransaction(fn) {
+  const pool = await getPool();
+  const tx = new mssql.Transaction(pool);
+  await tx.begin(mssql.ISOLATION_LEVEL.SERIALIZABLE);
+  let committed = false;
+  try {
+    const txAll = async (sqlText, params = []) =>
+      ((await runOnRequest(new mssql.Request(tx), sqlText, params)).recordset ?? []).map(decryptRow);
+    const txGet = async (sqlText, params = []) => {
+      const row = ((await runOnRequest(new mssql.Request(tx), sqlText, params)).recordset ?? [])[0];
+      return row ? decryptRow(row) : row;
+    };
+    const txRun = async (sqlText, params = []) => {
+      const result = await runOnRequest(new mssql.Request(tx), `${sqlText}; SELECT SCOPE_IDENTITY() AS lastID;`, params);
+      const sets = result.recordsets || [];
+      const lastID = (sets.length ? sets[sets.length - 1] : [])?.[0]?.lastID;
+      return { lastID: lastID == null ? undefined : Number(lastID), changes: result.rowsAffected?.[0] ?? 0 };
+    };
+    const out = await fn({ all: txAll, get: txGet, run: txRun });
+    await tx.commit();
+    committed = true;
+    return out;
+  } finally {
+    if (!committed) await tx.rollback().catch(() => {});
+  }
+}
+
+/** Devuelve todas las filas (descifra en sitio las columnas con sobre de cifrado). */
+export const all = async (sqlText, params = []) => ((await query(sqlText, params)).recordset ?? []).map(decryptRow);
+
+/** Devuelve la primera fila o undefined (descifrada). */
+export const get = async (sqlText, params = []) => {
+  const row = ((await query(sqlText, params)).recordset ?? [])[0];
+  return row ? decryptRow(row) : row;
+};
 
 /** Ejecuta INSERT/UPDATE/DELETE. Devuelve { lastID, changes }. */
 export const run = async (sqlText, params = []) => {

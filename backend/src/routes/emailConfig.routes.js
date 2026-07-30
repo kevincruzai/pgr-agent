@@ -1,7 +1,8 @@
 import { Router } from 'express';
 import { get, run } from '../db.js';
 import { requireAuth } from '../middleware/auth.js';
-import { testEmailConnection, syncInbox } from '../services/email.js';
+import { testEmailConnection, syncInbox, getInboxStatus } from '../services/email.js';
+import { encryptField } from '../services/fieldCrypto.js';
 
 const router = Router();
 router.use(requireAuth);
@@ -17,6 +18,16 @@ router.post('/test', async (req, res) => {
     res.json({ success: true, data: result });
   } catch (err) {
     res.status(400).json({ success: false, message: err.message });
+  }
+});
+
+/* ── Estado del buzón: total, importados y pendientes (en cola) sin importar ── */
+router.get('/status', async (req, res) => {
+  try {
+    const data = await getInboxStatus(req.user.id);
+    res.json({ success: true, data });
+  } catch (err) {
+    res.status(502).json({ success: false, message: err.responseText || err.message });
   }
 });
 
@@ -40,9 +51,9 @@ router.put('/', async (req, res) => {
   const { email_address, imap_host, imap_port, imap_secure, smtp_host, smtp_port, smtp_secure, email_password, provider, is_active } = req.body || {};
   const ex = await get('SELECT id FROM user_email_config WHERE user_id=?', [req.user.id]);
   const values = [
-    email_address || '', imap_host || '', imap_port || 993, imap_secure ? 1 : 0,
+    encryptField(email_address || ''), imap_host || '', imap_port || 993, imap_secure ? 1 : 0,
     smtp_host || '', smtp_port || 587, smtp_secure ? 1 : 0,
-    email_password || '', provider || 'other', is_active ? 1 : 0,
+    encryptField(email_password || ''), provider || 'other', is_active ? 1 : 0,
   ];
   if (ex) {
     await run(`UPDATE user_email_config SET email_address=?,imap_host=?,imap_port=?,imap_secure=?,smtp_host=?,smtp_port=?,smtp_secure=?,

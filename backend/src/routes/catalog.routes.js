@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { all, get, run } from '../db.js';
 import { requireAuth, requireAdmin } from '../middleware/auth.js';
+import { encryptField } from '../services/fieldCrypto.js';
 
 export const categoriesRouter = Router();
 
@@ -43,7 +44,7 @@ unitsRouter.post('/', requireAuth, requireAdmin, async (req, res) => {
   const ex = await get('SELECT id FROM units WHERE code=?', [code]);
   if (ex) return res.status(409).json({ success: false, message: 'El código ya existe' });
   const r = await run('INSERT INTO units(name,code,description,responsible_name,email,phone) VALUES(?,?,?,?,?,?)',
-    [name, code, description || '', responsible_name || '', email || '', phone || '']);
+    [name, code, description || '', responsible_name || '', encryptField(email || ''), phone || '']);
   res.json({ success: true, id: r.lastID });
 });
 
@@ -53,7 +54,7 @@ unitsRouter.put('/:id', requireAuth, requireAdmin, async (req, res) => {
   const ex = await get('SELECT id FROM units WHERE code=? AND id!=?', [code, req.params.id]);
   if (ex) return res.status(409).json({ success: false, message: 'El código ya existe en otra unidad' });
   await run('UPDATE units SET name=?,code=?,description=?,responsible_name=?,email=?,phone=?,is_active=? WHERE id=?',
-    [name, code, description || '', responsible_name || '', email || '', phone || '', is_active !== undefined ? (is_active ? 1 : 0) : 1, req.params.id]);
+    [name, code, description || '', responsible_name || '', encryptField(email || ''), phone || '', is_active !== undefined ? (is_active ? 1 : 0) : 1, req.params.id]);
   res.json({ success: true });
 });
 

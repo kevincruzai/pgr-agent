@@ -26,7 +26,8 @@ y reporta latencia y errores reales).
 | Clasificación de correspondencia (categoría/prioridad/resumen, incluye adjuntos) | Al enviar o sincronizar correos | Sin clasificar |
 | Análisis de cadenas por proyecto (resumen, riesgo, acciones, estado sugerido) | Bandeja → vista hilos → "Analizar con Gemini" | Mensaje indicando cómo activarlo |
 | Asistente LCP (método de contratación y asesoría según monto) | Procesos de Compra → Nueva → "Asistente LCP" | Solo la regla de umbrales LCP (siempre funciona) |
-| **Chat del proyecto** (botón flotante 💬 en el detalle): pregunta estado, responsable, fechas, riesgos, correspondencia | Proyectos → detalle | Mensaje indicando cómo activarlo |
+| **Chat del proyecto** (botón "Chat del proyecto" en el encabezado del expediente): pregunta estado, responsable, fechas, riesgos, correspondencia | Proyectos → detalle | Mensaje indicando cómo activarlo |
+| **Asistente IA personal** (botón flotante ✨ en la esquina inferior derecha, disponible en toda la app): conversa sobre los datos del propio usuario | Cualquier pantalla | Mensaje indicando cómo activarlo |
 | **Análisis ejecutivo de riesgos de vencimiento** para administración | Generado por el escáner de alertas | Solo alertas por reglas (siempre funcionan) |
 
 ### Escáner de vencimientos (sistema de alertas)
@@ -153,7 +154,7 @@ npm test     # 50 pruebas en ~2.5s (node:test nativo, sin dependencias extra)
 |-------|--------------|
 | `test/lcp.unit.test.js` | Reglas LCP puras: umbrales exactos ($87,600 inclusive), Baja Cuantía, escalado por salario mínimo, fases del ciclo |
 | `test/gemini.unit.test.js` | Preparación de adjuntos para IA: tipos analizables, normalización MIME, límites de 4MB/10MB |
-| `test/api.integration.test.js` | Operatividad real contra SQL Server: salud, autenticación (401/409/onboarding), autorización por rol (solicitante/jefe/admin/impersonación), ciclo de proyectos con auditoría en timeline, correspondencia con control de acceso, PAC (correlativos, exclusión de Baja Cuantía, totales), asistente LCP, escáner de alertas, presupuesto (consistencia aritmética), catálogos modernizados a LCP |
+| `test/api.integration.test.js` | Operatividad real contra SQL Server: salud, autenticación (401/409/onboarding), autorización por rol (solicitante/jefe/admin/impersonación), ciclo de proyectos con auditoría en timeline, correspondencia con control de acceso, PAC (correlativos, exclusión de Baja Cuantía, totales), asistente LCP, escáner de alertas, presupuesto (consistencia aritmética), catálogos modernizados a LCP, **aislamiento de datos del asistente IA personal** (el contexto de un usuario no contiene proyectos, correos ni alertas de otro) |
 
 Los datos de prueba usan el prefijo `TEST-AUDIT` y se eliminan automáticamente al finalizar.
 
@@ -206,6 +207,9 @@ backend/
 10. **Login como (control de admin)** — el administrador general puede entrar a la cuenta de cualquier usuario desde Gestión de Usuarios, con banner permanente y retorno seguro a su sesión
 10b. **Gestión de Usuarios** (acceso directo "Usuarios" en el menú, admin/jefe UCP) — el admin crea las cuentas con **clave temporal** (botón "Generar"), cargo, teléfono, rol y unidad; las credenciales se muestran una sola vez para entregarlas por canal seguro. El usuario está **obligado a cambiar la clave en su primer ingreso** (pantalla bloqueante con requisitos de fortaleza); el reseteo de clave por el admin reactiva la obligación. Cada usuario gestiona sus datos de contacto y su contraseña desde **Mi Perfil** (clic en su nombre, barra superior)
 11. **Presupuesto anual de compras** — el admin define año y monto; el dashboard muestra a toda la unidad el cumplimiento (comprometido/ejecutado/disponible) con alerta si se excede
+12. **Asistente IA personal** — botón flotante ✨ presente en toda la aplicación. Cada usuario conversa con **sus propios datos**: correos donde es remitente o destinatario, proyectos que creó o tiene asignados, sus alertas y sus solicitudes de compra. El presupuesto anual y el PAC se exponen **solo como cifras institucionales agregadas** (son datos compartidos de la unidad). El contexto lo arma el backend filtrando por el `id` del token JWT — ningún parámetro del cliente puede ampliar el alcance, por lo que un usuario nunca alcanza datos de otro. El panel abre con un resumen propio (correos sin leer, proyectos, alertas, vencimientos a 7 días) y preguntas sugeridas.
+
+> **Alcance del asistente**: el aislamiento se verifica en la suite (`asistente: el contexto de un usuario no incluye proyectos ni correos de otro`). Es deliberadamente **más estricto** que la pantalla de Proyectos, donde la cartera es visible para toda la unidad.
 
 > El tab **Gemini Pro API** solo es visible y accesible para la cuenta de **administrador general** (rol `admin`); el jefe UACP ve el resto de la configuración.
 
@@ -264,6 +268,8 @@ contratista → Contratación → Seguimiento → Liquidación.
 | GET | `/api/dashboard/budget-compliance` | Sí | Cumplimiento del presupuesto anual |
 | GET/POST/PUT/DELETE | `/api/pac` | Sí (DELETE admin) | Planificación Anual de Compras (PAC) |
 | POST | `/api/projects/:id/chat` | Sí | Chat IA con el expediente del proyecto |
+| POST | `/api/assistant/chat` | Sí | Asistente IA personal (solo datos del usuario del token) |
+| GET | `/api/assistant/summary` | Sí | Cifras propias del usuario para el panel del asistente |
 | POST | `/api/admin/alerts/scan` | Admin | Escaneo manual de vencimientos |
 | POST | `/api/auth/change-password` | Sí | Cambio de contraseña propio (limpia la clave temporal) |
 | PUT | `/api/auth/profile` | Sí | Actualizar datos de contacto propios |

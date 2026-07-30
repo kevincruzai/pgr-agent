@@ -3,11 +3,56 @@ import bcrypt from 'bcryptjs';
 import { all, get, run } from '../db.js';
 import { requireAuth, requireAdmin, requireSuperAdmin, signToken } from '../middleware/auth.js';
 import { testConnection } from '../services/gemini.js';
-import { syncAllInboxes } from '../services/email.js';
+import { syncAllInboxes, getNoreplyConfig, sendNoreplyTest, sendSystemMail } from '../services/email.js';
 import { verifyChain } from '../services/audit.js';
+import { encryptField, decryptEmbedded } from '../services/fieldCrypto.js';
 
 const router = Router();
 router.use(requireAuth, requireAdmin);
+
+/* Clave temporal legible: 3 sílabas + 3 dígitos + símbolo (≥8, letras y números). */
+function genTempPassword() {
+  const con = 'bcdfgmprstv', vow = 'aeiou';
+  let p = '';
+  for (let i = 0; i < 3; i++) p += con[Math.floor(Math.random() * con.length)] + vow[Math.floor(Math.random() * vow.length)];
+  return p[0].toUpperCase() + p.slice(1) + Math.floor(100 + Math.random() * 900) + '!';
+}
+
+const escapeHtml = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+function passwordEmailText(name, pw) {
+  return `Estimado/a ${name}:\n\nSe ha restablecido su contraseña de acceso al Sistema de Compras Públicas de la PGR (UACP).\n\nContraseña temporal: ${pw}\n\nPor seguridad, deberá cambiarla la primera vez que inicie sesión.\n\nEste es un mensaje automático, por favor no responda a este correo.\nProcuraduría General de la República — UACP`;
+}
+function passwordEmailHtml(name, pw) {
+  return `<div style="font-family:Arial,Helvetica,sans-serif;max-width:520px;margin:auto;color:#0f172a">
+    <h2 style="color:#1e40af;margin:0 0 12px">Restablecimiento de contraseña</h2>
+    <p>Estimado/a <strong>${escapeHtml(name)}</strong>:</p>
+    <p>Se ha restablecido su contraseña de acceso al <strong>Sistema de Compras Públicas de la PGR (UACP)</strong>.</p>
+    <p style="margin:16px 0 6px">Contraseña temporal:</p>
+    <p style="font-size:20px;font-weight:bold;background:#f1f5f9;padding:12px 18px;border-radius:8px;letter-spacing:1px;display:inline-block;margin:0">${escapeHtml(pw)}</p>
+    <p style="margin-top:16px">Por seguridad, deberá cambiarla la primera vez que inicie sesión.</p>
+    <hr style="border:none;border-top:1px solid #e2e8f0;margin:20px 0"/>
+    <p style="font-size:12px;color:#64748b">Este es un mensaje automático, por favor no responda. Procuraduría General de la República — UACP.</p>
+  </div>`;
+}
+
+function welcomeEmailText(name, doc, pw) {
+  return `Estimado/a ${name}:\n\nSe ha creado su cuenta en el Sistema de Compras Públicas de la PGR (UACP).\n\nIngrese con:\n  Documento: ${doc}\n  Contraseña temporal: ${pw}\n\nPor seguridad, deberá cambiar la contraseña la primera vez que inicie sesión.\n\nEste es un mensaje automático, por favor no responda a este correo.\nProcuraduría General de la República — UACP`;
+}
+function welcomeEmailHtml(name, doc, pw) {
+  return `<div style="font-family:Arial,Helvetica,sans-serif;max-width:520px;margin:auto;color:#0f172a">
+    <h2 style="color:#1e40af;margin:0 0 12px">Bienvenido/a al Sistema de Compras Públicas</h2>
+    <p>Estimado/a <strong>${escapeHtml(name)}</strong>:</p>
+    <p>Se ha creado su cuenta en el <strong>Sistema de Compras Públicas de la PGR (UACP)</strong>. Ingrese con las siguientes credenciales:</p>
+    <table style="margin:12px 0;font-size:15px">
+      <tr><td style="padding:4px 8px;color:#64748b">Documento:</td><td style="padding:4px 8px;font-weight:bold">${escapeHtml(doc)}</td></tr>
+      <tr><td style="padding:4px 8px;color:#64748b">Contraseña temporal:</td><td style="padding:4px 8px"><span style="font-weight:bold;background:#f1f5f9;padding:6px 12px;border-radius:6px;letter-spacing:1px">${escapeHtml(pw)}</span></td></tr>
+    </table>
+    <p>Por seguridad, deberá cambiar la contraseña la primera vez que inicie sesión.</p>
+    <hr style="border:none;border-top:1px solid #e2e8f0;margin:20px 0"/>
+    <p style="font-size:12px;color:#64748b">Este es un mensaje automático, por favor no responda. Procuraduría General de la República — UACP.</p>
+  </div>`;
+}
 
 /* ── Bitácora de auditoría (solo administrador general) ── */
 router.get('/audit', requireSuperAdmin, async (req, res) => {
@@ -26,6 +71,10 @@ router.get('/audit', requireSuperAdmin, async (req, res) => {
   const rows = await all(`SELECT id, event_time, user_id, user_name, impersonated_by, action, entity, entity_id,
       details, success, ip, row_hash
     FROM audit_log ${whereSql} ORDER BY id DESC OFFSET ${offset} ROWS FETCH NEXT ${limit} ROWS ONLY`, params);
+  // La bitácora guarda los correos cifrados; se descifran solo para el auditor
+  // autorizado al mostrarlos. El row_hash se calculó sobre el dato cifrado, por
+  // lo que la verificación de integridad (/audit/verify) no se ve afectada.
+  for (const r of rows) r.details = decryptEmbedded(r.details);
   res.json({ success: true, data: { rows, total: total.c, limit, offset } });
 });
 
@@ -35,16 +84,9 @@ router.get('/audit/verify', requireSuperAdmin, async (_req, res) => {
   res.json({ success: true, data: result });
 });
 
-/* ── Login como otro usuario (solo administrador general) ── */
+/* ── Login como otro usuario (funcionalidad desactivada) ── */
 router.post('/impersonate/:id', requireSuperAdmin, async (req, res) => {
-  if (Number(req.params.id) === req.user.id) {
-    return res.status(400).json({ success: false, message: 'Ya está en su propia sesión' });
-  }
-  const target = await get('SELECT id,name,document_type,document_number,email,role,unit_id,is_active FROM users WHERE id=?', [req.params.id]);
-  if (!target) return res.status(404).json({ success: false, message: 'Usuario no encontrado' });
-  if (!target.is_active) return res.status(400).json({ success: false, message: 'El usuario está inactivo' });
-  const token = signToken(target, { impersonated_by: req.user.id, impersonated_by_name: req.user.name });
-  res.json({ success: true, token, user: target });
+  return res.status(403).json({ success: false, message: 'La función de iniciar sesión como otro usuario está desactivada' });
 });
 
 /* ── Prueba REAL de conexión con Gemini (acepta key/modelo sin guardar; solo admin general) ── */
@@ -80,8 +122,27 @@ router.post('/users', async (req, res) => {
   const hash = await bcrypt.hash(password, 10);
   const r = await run(`INSERT INTO users(name,document_type,document_number,email,phone,position,password_hash,role,unit_id,is_active,must_change_password)
     VALUES(?,?,?,?,?,?,?,?,?,1,1)`,
-    [name, document_type || 'DUI', String(document_number), email || '', phone || '', position || '', hash, role || 'solicitante', unit_id || null]);
-  res.json({ success: true, id: r.lastID, must_change_password: true });
+    [name, document_type || 'DUI', String(document_number), encryptField(email || ''), phone || '', position || '', hash, role || 'solicitante', unit_id || null]);
+
+  // Envía las credenciales iniciales al correo del usuario desde la cuenta no-reply.
+  let emailed = false, message = '';
+  if (email) {
+    try {
+      await sendSystemMail({
+        to: email,
+        subject: 'Bienvenido/a al Sistema de Compras Públicas — PGR',
+        text: welcomeEmailText(name, String(document_number), password),
+        html: welcomeEmailHtml(name, String(document_number), password),
+      });
+      emailed = true;
+      message = `Credenciales enviadas a ${email}.`;
+    } catch (err) {
+      message = `Usuario creado, pero no se pudo enviar el correo: ${err.message}`;
+    }
+  } else {
+    message = 'El usuario no tiene correo; entregue la clave manualmente.';
+  }
+  res.json({ success: true, id: r.lastID, must_change_password: true, emailed, email: email || '', message });
 });
 
 router.put('/users/:id', async (req, res) => {
@@ -92,10 +153,10 @@ router.put('/users/:id', async (req, res) => {
     /* Reseteo de clave por el admin → vuelve a ser temporal */
     const hash = await bcrypt.hash(password, 10);
     await run('UPDATE users SET name=?,email=?,phone=?,position=?,role=?,unit_id=?,is_active=?,password_hash=?,must_change_password=1 WHERE id=?',
-      [name, email || '', phone || '', position || '', role || 'solicitante', unit_id || null, active, hash, req.params.id]);
+      [name, encryptField(email || ''), phone || '', position || '', role || 'solicitante', unit_id || null, active, hash, req.params.id]);
   } else {
     await run('UPDATE users SET name=?,email=?,phone=?,position=?,role=?,unit_id=?,is_active=? WHERE id=?',
-      [name, email || '', phone || '', position || '', role || 'solicitante', unit_id || null, active, req.params.id]);
+      [name, encryptField(email || ''), phone || '', position || '', role || 'solicitante', unit_id || null, active, req.params.id]);
   }
   res.json({ success: true });
 });
@@ -106,6 +167,36 @@ router.delete('/users/:id', async (req, res) => {
   }
   await run('UPDATE users SET is_active=0 WHERE id=?', [req.params.id]);
   res.json({ success: true });
+});
+
+/* ── Regenerar la clave temporal de un usuario y enviársela por el correo no-reply ── */
+router.post('/users/:id/regenerate-password', async (req, res) => {
+  const user = await get('SELECT id, name, email FROM users WHERE id=?', [req.params.id]);
+  if (!user) return res.status(404).json({ success: false, message: 'Usuario no encontrado' });
+
+  const tempPassword = genTempPassword();
+  const hash = await bcrypt.hash(tempPassword, 10);
+  await run('UPDATE users SET password_hash=?, must_change_password=1 WHERE id=?', [hash, req.params.id]);
+
+  let emailed = false, message = '';
+  if (!user.email) {
+    message = 'El usuario no tiene correo registrado; entregue la clave manualmente.';
+  } else {
+    try {
+      await sendSystemMail({
+        to: user.email,
+        subject: 'Restablecimiento de contraseña — PGR Compras Públicas',
+        text: passwordEmailText(user.name, tempPassword),
+        html: passwordEmailHtml(user.name, tempPassword),
+      });
+      emailed = true;
+      message = `Clave temporal enviada a ${user.email}.`;
+    } catch (err) {
+      message = `Clave regenerada, pero no se pudo enviar el correo: ${err.message}`;
+    }
+  }
+  // La clave se devuelve al admin como respaldo; nunca queda en la bitácora (el body de la petición está vacío).
+  res.json({ success: true, emailed, email: user.email || '', temp_password: tempPassword, message });
 });
 
 /* ── Escaneo manual de vencimientos (genera alertas + análisis IA) ── */
@@ -147,18 +238,64 @@ router.delete('/alerts/:id', async (req, res) => {
 router.get('/settings', requireSuperAdmin, async (_req, res) => {
   const data = await all('SELECT * FROM settings ORDER BY [key]');
   const obj = {};
-  data.forEach(s => { obj[s.key] = s.value; });
+  // Las claves noreply_ (incluyen un secreto SMTP cifrado) se gestionan en su
+  // propio endpoint; se excluyen de aquí para no filtrarlas ni sobrescribirlas.
+  data.forEach(s => { if (!s.key.startsWith('noreply_')) obj[s.key] = s.value; });
   res.json({ success: true, data: obj });
 });
 
 router.put('/settings', requireSuperAdmin, async (req, res) => {
-  const entries = Object.entries(req.body || {});
+  const entries = Object.entries(req.body || {}).filter(([key]) => !key.startsWith('noreply_'));
   for (const [key, value] of entries) {
     const ex = await get('SELECT id FROM settings WHERE [key]=?', [key]);
     if (ex) await run('UPDATE settings SET value=?, updated_at=SYSDATETIME() WHERE [key]=?', [String(value), key]);
     else await run('INSERT INTO settings([key],value) VALUES(?,?)', [key, String(value)]);
   }
   res.json({ success: true });
+});
+
+/* ── Correo institucional No-Reply (envío de credenciales; solo admin general) ── */
+router.get('/noreply-config', requireSuperAdmin, async (_req, res) => {
+  const c = await getNoreplyConfig();
+  res.json({ success: true, data: {
+    smtp_host: c.host, smtp_port: c.port, smtp_secure: c.secure, smtp_user: c.user,
+    from_name: c.fromName, from_email: c.fromEmail, enabled: c.enabled,
+    has_password: !!c.pass, // nunca se devuelve la contraseña en claro
+  }});
+});
+
+router.put('/noreply-config', requireSuperAdmin, async (req, res) => {
+  const b = req.body || {};
+  const kv = {
+    noreply_smtp_host: String(b.smtp_host || ''),
+    noreply_smtp_port: String(Number(b.smtp_port) || 587),
+    noreply_smtp_secure: b.smtp_secure ? 'true' : 'false',
+    noreply_smtp_user: String(b.smtp_user || ''),
+    noreply_from_name: String(b.from_name || ''),
+    noreply_from_email: String(b.from_email || ''),
+    noreply_enabled: b.enabled ? 'true' : 'false',
+  };
+  // La contraseña solo se reescribe si se envía una nueva; se guarda CIFRADA.
+  if (b.smtp_pass) kv.noreply_smtp_pass = encryptField(String(b.smtp_pass));
+  for (const [key, value] of Object.entries(kv)) {
+    const ex = await get('SELECT id FROM settings WHERE [key]=?', [key]);
+    if (ex) await run('UPDATE settings SET value=?, updated_at=SYSDATETIME() WHERE [key]=?', [value, key]);
+    else await run('INSERT INTO settings([key],value) VALUES(?,?)', [key, value]);
+  }
+  res.json({ success: true });
+});
+
+router.post('/noreply-config/test', requireSuperAdmin, async (req, res) => {
+  const b = req.body || {};
+  try {
+    const r = await sendNoreplyTest({
+      host: b.smtp_host, port: b.smtp_port, secure: b.smtp_secure,
+      user: b.smtp_user, pass: b.smtp_pass, fromName: b.from_name, fromEmail: b.from_email,
+    }, b.to);
+    res.json({ success: true, message: `Correo de prueba enviado a ${r.to}.` });
+  } catch (err) {
+    res.status(400).json({ success: false, message: err.message });
+  }
 });
 
 /* ── Configuraciones de correo de todos los usuarios ── */

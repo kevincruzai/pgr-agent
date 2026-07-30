@@ -551,6 +551,29 @@ function InboxView({ starred }){
   const [attachments,setAttachments]=useState([]);
   const [page,setPage]=useState(1);
   const [pageInfo,setPageInfo]=useState({total:0,totalPages:1,pageSize:25});
+  const [syncing,setSyncing]=useState(false);
+  const [inboxStatus,setInboxStatus]=useState(null); // {configured,active,total,imported,pending,last_sync}
+  const [syncMsg,setSyncMsg]=useState(null);          // {ok,text}
+
+  const loadStatus=useCallback(async()=>{
+    // Consulta el buzón IMAP para saber cuántos correos faltan por sincronizar.
+    const res=await apiFetch('/email-config/status');
+    setInboxStatus(res.success?res.data:null);
+  },[]);
+
+  async function syncNow(){
+    setSyncing(true); setSyncMsg(null);
+    // limit:0 → sincronización COMPLETA: trae todos los correos pendientes del buzón.
+    const res=await apiFetch('/email-config/sync',{method:'POST',body:JSON.stringify({limit:0})});
+    if(res.success){
+      const d=res.data;
+      setSyncMsg({ok:true,text:d.imported>0
+        ? `${d.imported} correo(s) importado(s). ${d.pending>0?`Quedan ${d.pending} en cola.`:'Bandeja al día.'}`
+        : `No hay correos nuevos. ${d.pending>0?`${d.pending} en cola.`:'Bandeja al día.'}`});
+      loadInbox(); loadStatus();
+    } else setSyncMsg({ok:false,text:res.message||'Error al sincronizar'});
+    setSyncing(false);
+  }
 
   async function analyzeThreadAI(projectId,e){
     e.stopPropagation();
@@ -585,6 +608,8 @@ function InboxView({ starred }){
     if(viewMode==='inbox') loadInbox();
     else loadThreads();
   },[viewMode,loadInbox,loadThreads]);
+
+  useEffect(()=>{ loadStatus(); },[loadStatus]);
 
   async function toggleStar(id,e){
     e.stopPropagation();
@@ -685,7 +710,32 @@ function InboxView({ starred }){
           <input style={styles.searchInput} placeholder="Buscar en correspondencia..." value={search} onChange={e=>setSearch(e.target.value)} onKeyDown={e=>e.key==='Enter'&&loadInbox()}/>
           {search&&<button onClick={()=>setSearch('')} style={{background:'none',border:'none',cursor:'pointer'}}><Icon name="close" size={20} color="#94a3b8"/></button>}
         </div>}
+        {viewMode==='inbox'&&(
+          <div style={{display:'flex',alignItems:'center',gap:8,flexShrink:0}}>
+            {inboxStatus&&inboxStatus.active&&(
+              <span title={`${inboxStatus.imported} importados de ${inboxStatus.total} en el servidor`}
+                style={{...styles.tagSmall,background:inboxStatus.pending>0?'#f59e0b':'#22c55e',whiteSpace:'nowrap'}}>
+                {inboxStatus.pending>0?`En cola: ${inboxStatus.pending}`:'Al día'}
+              </span>
+            )}
+            <button onClick={syncNow} disabled={syncing||(inboxStatus&&inboxStatus.configured&&!inboxStatus.active)}
+              title={inboxStatus&&inboxStatus.configured&&!inboxStatus.active?'Active su correo en "Correo Electrónico"':'Sincronización completa: trae TODOS los correos pendientes (puede tardar si hay muchos)'}
+              style={{display:'flex',alignItems:'center',gap:6,padding:'9px 14px',borderRadius:10,border:'none',flexShrink:0,
+                cursor:syncing?'default':'pointer',fontSize:13,fontWeight:600,color:'#fff',whiteSpace:'nowrap',
+                background:syncing?'#94a3b8':'linear-gradient(135deg,#059669,#10b981)'}}>
+              <Icon name="sync" size={18} color="#fff"/>{syncing?'Sincronizando...':'Sincronizar'}
+            </button>
+          </div>
+        )}
       </div>
+
+      {viewMode==='inbox'&&syncMsg&&(
+        <div style={{marginBottom:12,padding:'10px 14px',borderRadius:10,display:'flex',alignItems:'center',gap:8,
+          background:syncMsg.ok?'#f0fdf4':'#fef2f2',border:`1px solid ${syncMsg.ok?'#86efac':'#fca5a5'}`}}>
+          <Icon name={syncMsg.ok?'cloud_done':'error'} size={20} color={syncMsg.ok?'#22c55e':'#ef4444'}/>
+          <span style={{fontSize:13,color:syncMsg.ok?'#166534':'#991b1b'}}>{syncMsg.text}</span>
+        </div>
+      )}
 
       {loading?<div style={styles.loading}><Icon name="hourglass_top" size={32} color="#94a3b8"/><p>Cargando...</p></div>:
 
@@ -1182,9 +1232,18 @@ function ProjectsView(){
               {p.deadline&&<div style={{display:'flex',alignItems:'center',gap:4,justifyContent:'flex-end',marginTop:4}}>
                 <Icon name="event" size={16} color={deadlineColor}/><span style={{fontSize:13,fontWeight:600,color:deadlineColor}}>{days<=0?'VENCIDO':`${days} días · ${formatDate(p.deadline)}`}</span>
               </div>}
-              <button onClick={()=>showEdit?setShowEdit(false):openEdit(p)} style={{...styles.actionBtn,padding:'6px 14px',fontSize:13,marginTop:8,marginLeft:'auto'}}>
-                <Icon name="edit" size={16} color="#fff"/><span>{showEdit?'Cerrar edición':'Editar Proyecto'}</span>
-              </button>
+              <div style={{display:'flex',gap:8,justifyContent:'flex-end',marginTop:8}}>
+                {/* Chat del expediente: vive aquí (no flotante) para no chocar con el
+                    asistente global, que ocupa la esquina inferior derecha. */}
+                <button onClick={()=>setChatOpen(o=>!o)} title="Preguntar a la IA sobre este expediente"
+                  style={{display:'inline-flex',alignItems:'center',gap:6,padding:'6px 14px',fontSize:13,fontWeight:700,cursor:'pointer',
+                    borderRadius:9,border:'1px solid #bfdbfe',background:chatOpen?'#dbeafe':'#eff6ff',color:'#1e40af'}}>
+                  <Icon name="forum" size={16} color="#1e40af"/><span>{chatOpen?'Cerrar chat':'Chat del proyecto'}</span>
+                </button>
+                <button onClick={()=>showEdit?setShowEdit(false):openEdit(p)} style={{...styles.actionBtn,padding:'6px 14px',fontSize:13}}>
+                  <Icon name="edit" size={16} color="#fff"/><span>{showEdit?'Cerrar edición':'Editar Proyecto'}</span>
+                </button>
+              </div>
             </div>
           </div>
 
@@ -1396,17 +1455,10 @@ function ProjectsView(){
         </>
         )}
 
-        {/* ── Chat IA flotante del proyecto ── */}
-        {!chatOpen&&(
-          <button onClick={()=>setChatOpen(true)} title="Preguntar a la IA sobre este proyecto"
-            style={{position:'fixed',bottom:24,right:24,width:60,height:60,borderRadius:'50%',border:'none',cursor:'pointer',zIndex:1000,
-              background:'linear-gradient(135deg,#3b82f6,#8b5cf6)',boxShadow:'0 8px 25px rgba(59,130,246,0.4)',
-              display:'flex',alignItems:'center',justifyContent:'center'}}>
-            <Icon name="forum" size={28} color="#fff"/>
-          </button>
-        )}
+        {/* ── Chat IA del proyecto (se abre desde el encabezado del expediente) ──
+             Se ancla arriba del asistente global para que ambos puedan convivir. */}
         {chatOpen&&(
-          <div style={{position:'fixed',bottom:24,right:24,width:380,height:520,zIndex:1000,display:'flex',flexDirection:'column',
+          <div style={{position:'fixed',bottom:24,right:100,width:380,height:520,zIndex:1000,display:'flex',flexDirection:'column',
             background:'#fff',borderRadius:18,boxShadow:'0 20px 60px rgba(15,23,42,0.3)',border:'1px solid #e2e8f0',overflow:'hidden'}}>
             {/* Header */}
             <div style={{display:'flex',alignItems:'center',gap:10,padding:'12px 16px',background:'linear-gradient(135deg,#0f172a,#1e293b)'}}>
@@ -2341,6 +2393,7 @@ function SettingsView({ userRole, currentUserId, initialTab }){
     {id:'users',icon:'people',label:'Gestión de Usuarios'},
     {id:'alerts_mgmt',icon:'notification_add',label:'Gestión de Alertas'},
     ...(userRole==='admin'?[
+      {id:'noreply',icon:'mark_email_read',label:'Correo No-Reply'},
       {id:'gemini',icon:'psychology',label:'Gemini Pro API'},
       {id:'audit',icon:'verified_user',label:'Bitácora'},
     ]:[]),
@@ -2358,6 +2411,7 @@ function SettingsView({ userRole, currentUserId, initialTab }){
       {subTab==='tracking'&&<SettingsTrackingTab userRole={userRole}/>}
       {subTab==='users'&&<SettingsUsersTab userRole={userRole} currentUserId={currentUserId}/>}
       {subTab==='alerts_mgmt'&&<SettingsAlertsTab/>}
+      {subTab==='noreply'&&userRole==='admin'&&<SettingsNoreplyTab/>}
       {subTab==='gemini'&&userRole==='admin'&&<SettingsGeminiTab/>}
       {subTab==='audit'&&userRole==='admin'&&<SettingsAuditTab/>}
     </div>
@@ -2383,18 +2437,6 @@ function SettingsUsersTab({ userRole, currentUserId }){
     for(let i=0;i<3;i++) p+=con[Math.floor(Math.random()*con.length)]+vow[Math.floor(Math.random()*vow.length)];
     p=p[0].toUpperCase()+p.slice(1)+Math.floor(100+Math.random()*900)+'!';
     setForm(f=>({...f,password:p}));
-  }
-
-  /* Login como: respalda la sesión del admin y entra a la cuenta del usuario */
-  async function loginAs(u){
-    if(!window.confirm(`¿Iniciar sesión como ${u.name}? Podrás volver a tu cuenta de administrador en cualquier momento.`)) return;
-    const res=await apiFetch(`/admin/impersonate/${u.id}`,{method:'POST'});
-    if(!res.success){ alert(res.message||'No se pudo iniciar la sesión de control'); return; }
-    const backup={ token:localStorage.getItem(STORAGE_TOKEN), user:JSON.parse(localStorage.getItem(STORAGE_USER)||'null') };
-    localStorage.setItem(STORAGE_ADMIN_BACKUP, JSON.stringify(backup));
-    localStorage.setItem(STORAGE_TOKEN, res.token);
-    localStorage.setItem(STORAGE_USER, JSON.stringify(res.user));
-    window.location.reload();
   }
 
   const load=useCallback(async()=>{
@@ -2431,7 +2473,7 @@ function SettingsUsersTab({ userRole, currentUserId }){
     } else {
       if(!body.password||body.password.length<8) return setError('La clave temporal debe tener al menos 8 caracteres (use "Generar")');
       res=await apiFetch('/admin/users',{method:'POST',body:JSON.stringify(body)});
-      if(res.success) setCreatedInfo({name:form.name,doc:form.document_number,tempPassword:body.password});
+      if(res.success) setCreatedInfo({name:form.name,doc:form.document_number,tempPassword:body.password,emailed:res.emailed,emailMsg:res.message});
     }
     if(res.success){setShowForm(false);load();}
     else setError(res.message||'Error');
@@ -2441,6 +2483,16 @@ function SettingsUsersTab({ userRole, currentUserId }){
     if(u.is_active) await apiFetch(`/admin/users/${u.id}`,{method:'DELETE'});
     else await apiFetch(`/admin/users/${u.id}`,{method:'PUT',body:JSON.stringify({...u,is_active:1,name:u.name})});
     load();
+  }
+
+  async function regeneratePassword(u){
+    const dest=u.email?` y se enviará a ${u.email}`:' (el usuario no tiene correo: deberá entregarla manualmente)';
+    if(!window.confirm(`¿Regenerar la contraseña de ${u.name}? Se generará una nueva clave temporal${dest}.`)) return;
+    const res=await apiFetch(`/admin/users/${u.id}/regenerate-password`,{method:'POST'});
+    if(res.success){
+      setCreatedInfo({name:u.name,doc:u.document_number,tempPassword:res.temp_password,reset:true,emailed:res.emailed,emailMsg:res.message});
+      load();
+    } else alert(res.message||'No se pudo regenerar la contraseña');
   }
 
   const ROLES=[{v:'admin',l:'Administrador'},{v:'jefe_uacp',l:'Jefe UACP'},{v:'analista',l:'Analista'},{v:'solicitante',l:'Solicitante'}];
@@ -2469,6 +2521,12 @@ function SettingsUsersTab({ userRole, currentUserId }){
                 <code style={{margin:'0 6px',padding:'3px 10px',borderRadius:6,background:'#dcfce7',fontWeight:700,fontSize:14}}>{createdInfo.tempPassword}</code>
                 <button onClick={()=>navigator.clipboard?.writeText(createdInfo.tempPassword)} style={{...styles.iconBtn,verticalAlign:'middle'}} title="Copiar clave"><Icon name="content_copy" size={16} color="#16a34a"/></button>
               </div>
+              {createdInfo.emailed!==undefined&&(
+                <div style={{fontSize:12,fontWeight:600,marginTop:6,display:'flex',alignItems:'center',gap:6,color:createdInfo.emailed?'#15803d':'#b45309'}}>
+                  <Icon name={createdInfo.emailed?'mark_email_read':'unsubscribe'} size={16} color={createdInfo.emailed?'#16a34a':'#d97706'}/>
+                  {createdInfo.emailMsg||(createdInfo.emailed?'Enviada por correo al usuario.':'No se envió por correo.')}
+                </div>
+              )}
               <div style={{fontSize:12,color:'#15803d',marginTop:4}}>
                 ⚠ Cópiela y entréguela por un canal seguro — <strong>no volverá a mostrarse</strong>. El usuario deberá cambiarla en su primer inicio de sesión.
               </div>
@@ -2536,12 +2594,8 @@ function SettingsUsersTab({ userRole, currentUserId }){
                   <td style={styles.td}>
                     <div style={{display:'flex',gap:4}}>
                       <button onClick={()=>openEdit(u)} style={styles.iconBtn} title="Editar"><Icon name="edit" size={18} color="#3b82f6"/></button>
+                      <button onClick={()=>regeneratePassword(u)} style={styles.iconBtn} title="Regenerar contraseña y enviarla por correo"><Icon name="lock_reset" size={18} color="#f59e0b"/></button>
                       <button onClick={()=>toggleUser(u)} style={styles.iconBtn} title={u.is_active?'Desactivar':'Activar'}><Icon name={u.is_active?'person_off':'person'} size={18} color={u.is_active?'#ef4444':'#22c55e'}/></button>
-                      {userRole==='admin'&&u.id!==currentUserId&&u.is_active&&(
-                        <button onClick={()=>loginAs(u)} style={styles.iconBtn} title={`Iniciar sesión como ${u.name} (control de administrador)`}>
-                          <Icon name="supervisor_account" size={18} color="#7c3aed"/>
-                        </button>
-                      )}
                     </div>
                   </td>
                 </tr>
@@ -3227,6 +3281,140 @@ function SettingsGeminiTab(){
   );
 }
 
+/* ── Correo institucional No-Reply (envío de credenciales) ── */
+function SettingsNoreplyTab(){
+  const [cfg,setCfg]=useState({smtp_host:'',smtp_port:'587',smtp_secure:false,smtp_user:'',smtp_pass:'',from_name:'PGR Compras Públicas',from_email:'',enabled:false,has_password:false});
+  const [loading,setLoading]=useState(true);
+  const [saved,setSaved]=useState(false);
+  const [testing,setTesting]=useState(false);
+  const [testResult,setTestResult]=useState(null);
+  const [testTo,setTestTo]=useState('');
+
+  useEffect(()=>{
+    (async()=>{
+      const res=await apiFetch('/admin/noreply-config');
+      if(res.success) setCfg(prev=>({...prev,...res.data,smtp_port:String(res.data.smtp_port||587),smtp_pass:''}));
+      setLoading(false);
+    })();
+  },[]);
+
+  function upd(k,v){setCfg(p=>({...p,[k]:v}));setSaved(false);}
+
+  async function save(e){
+    e.preventDefault();
+    const res=await apiFetch('/admin/noreply-config',{method:'PUT',body:JSON.stringify(cfg)});
+    if(res.success){
+      setSaved(true);
+      setCfg(p=>({...p,has_password:p.has_password||!!p.smtp_pass,smtp_pass:''}));
+      setTimeout(()=>setSaved(false),3000);
+    }
+  }
+
+  async function test(){
+    setTesting(true); setTestResult(null);
+    const res=await apiFetch('/admin/noreply-config/test',{method:'POST',body:JSON.stringify({...cfg,to:testTo||undefined})});
+    setTestResult({ok:!!res.success,message:res.message||(res.success?'Correo de prueba enviado':'Error al enviar')});
+    setTesting(false);
+  }
+
+  if(loading) return <div style={styles.loading}><Icon name="hourglass_top" size={32} color="#94a3b8"/><p>Cargando configuración...</p></div>;
+
+  const dark={...styles.input,background:'#1e293b',color:'#e2e8f0',border:'1px solid #334155'};
+  return (
+    <div>
+      <div style={{...styles.card,marginTop:16,background:'linear-gradient(135deg,#0f172a,#1e293b)',border:'1px solid #334155'}}>
+        <div style={{display:'flex',alignItems:'center',gap:12,marginBottom:20}}>
+          <div style={{width:48,height:48,borderRadius:14,background:'linear-gradient(135deg,#0ea5e9,#3b82f6)',display:'flex',alignItems:'center',justifyContent:'center'}}>
+            <Icon name="mark_email_read" size={28} color="#fff"/>
+          </div>
+          <div>
+            <h4 style={{fontSize:18,fontWeight:700,color:'#f1f5f9',margin:0}}>Correo No-Reply</h4>
+            <p style={{fontSize:13,color:'#94a3b8',margin:0}}>Cuenta institucional para enviar credenciales y notificaciones del sistema</p>
+          </div>
+          <div style={{marginLeft:'auto'}}>
+            <span style={{...styles.tagSmall,background:cfg.enabled?'#22c55e':'#64748b'}}>{cfg.enabled?'ACTIVO':'INACTIVO'}</span>
+          </div>
+        </div>
+
+        <form onSubmit={save}>
+          <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:16}}>
+            <div>
+              <label style={{...styles.label,color:'#94a3b8'}}>Servidor SMTP</label>
+              <input style={dark} value={cfg.smtp_host} onChange={e=>upd('smtp_host',e.target.value)} placeholder="smtp.pgr.gob.sv"/>
+            </div>
+            <div>
+              <label style={{...styles.label,color:'#94a3b8'}}>Puerto</label>
+              <input style={dark} type="number" value={cfg.smtp_port} onChange={e=>upd('smtp_port',e.target.value)} placeholder="587"/>
+            </div>
+            <div>
+              <label style={{...styles.label,color:'#94a3b8'}}>Usuario SMTP</label>
+              <input style={dark} value={cfg.smtp_user} onChange={e=>upd('smtp_user',e.target.value)} placeholder="no-reply@pgr.gob.sv"/>
+            </div>
+            <div>
+              <label style={{...styles.label,color:'#94a3b8'}}>Contraseña SMTP {cfg.has_password&&<span style={{color:'#22c55e'}}>· guardada</span>}</label>
+              <input style={dark} type="password" value={cfg.smtp_pass} onChange={e=>upd('smtp_pass',e.target.value)} placeholder={cfg.has_password?'•••••• (dejar vacío para no cambiar)':'Contraseña de la cuenta'}/>
+            </div>
+            <div>
+              <label style={{...styles.label,color:'#94a3b8'}}>Remitente (nombre)</label>
+              <input style={dark} value={cfg.from_name} onChange={e=>upd('from_name',e.target.value)} placeholder="PGR Compras Públicas"/>
+            </div>
+            <div>
+              <label style={{...styles.label,color:'#94a3b8'}}>Remitente (correo)</label>
+              <input style={dark} type="email" value={cfg.from_email} onChange={e=>upd('from_email',e.target.value)} placeholder="no-reply@pgr.gob.sv"/>
+            </div>
+            <div>
+              <label style={{...styles.label,color:'#94a3b8'}}>Seguridad</label>
+              <select style={{...styles.select,background:'#1e293b',color:'#e2e8f0',border:'1px solid #334155'}} value={cfg.smtp_secure?'true':'false'} onChange={e=>upd('smtp_secure',e.target.value==='true')}>
+                <option value="false">STARTTLS (587)</option>
+                <option value="true">TLS/SSL (465)</option>
+              </select>
+            </div>
+            <div>
+              <label style={{...styles.label,color:'#94a3b8'}}>Estado</label>
+              <select style={{...styles.select,background:'#1e293b',color:'#e2e8f0',border:'1px solid #334155'}} value={cfg.enabled?'true':'false'} onChange={e=>upd('enabled',e.target.value==='true')}>
+                <option value="true">Activado</option>
+                <option value="false">Desactivado</option>
+              </select>
+            </div>
+          </div>
+
+          <div style={{display:'flex',gap:8,marginTop:16,alignItems:'flex-end'}}>
+            <div style={{flex:1}}>
+              <label style={{...styles.label,color:'#94a3b8'}}>Enviar prueba a (opcional)</label>
+              <input style={dark} type="email" value={testTo} onChange={e=>setTestTo(e.target.value)} placeholder="Por defecto, al remitente"/>
+            </div>
+          </div>
+
+          <div style={{display:'flex',gap:12,marginTop:16}}>
+            <button type="submit" style={{...styles.submitBtn,flex:1}}>{saved?'✓ Guardado':'Guardar Configuración'}</button>
+            <button type="button" onClick={test} disabled={testing} style={{...styles.submitBtn,flex:1,background:testing?'#475569':'linear-gradient(135deg,#0ea5e9,#3b82f6)'}}>
+              {testing?'Enviando...':'Enviar correo de prueba'}
+            </button>
+          </div>
+        </form>
+
+        {testResult && (
+          <div style={{marginTop:16,padding:'12px 16px',borderRadius:10,background:testResult.ok?'rgba(34,197,94,0.1)':'rgba(239,68,68,0.1)',border:`1px solid ${testResult.ok?'rgba(34,197,94,0.3)':'rgba(239,68,68,0.3)'}`,display:'flex',alignItems:'center',gap:10}}>
+            <Icon name={testResult.ok?'check_circle':'error'} size={22} color={testResult.ok?'#22c55e':'#ef4444'}/>
+            <span style={{fontSize:13,color:testResult.ok?'#86efac':'#fca5a5'}}>{testResult.message}</span>
+          </div>
+        )}
+      </div>
+
+      <div style={{...styles.card,marginTop:16}}>
+        <div style={styles.cardHeader}>
+          <Icon name="info" size={22} color="#0ea5e9"/>
+          <h3 style={styles.cardTitle}>¿Para qué se usa?</h3>
+        </div>
+        <p style={{fontSize:13,color:'#64748b',margin:0}}>
+          Desde <strong>Gestión de Usuarios</strong>, el botón <Icon name="lock_reset" size={16} color="#f59e0b" style={{verticalAlign:'middle'}}/> <strong>Regenerar contraseña</strong> genera una clave temporal
+          y la envía automáticamente al correo del usuario desde esta cuenta no-reply. La contraseña SMTP se guarda <strong>cifrada</strong> en la base de datos.
+        </p>
+      </div>
+    </div>
+  );
+}
+
 /* ══════════════════════════════════════════════════════════════
    MAIN APP (Dashboard Layout)
    ══════════════════════════════════════════════════════════════ */
@@ -3301,20 +3489,49 @@ function ForcePasswordChange({ user, onChanged, onLogout }){
    MI PERFIL — datos de contacto y cambio de contraseña
    ══════════════════════════════════════════════════════════════ */
 
-function ProfileModal({ user, onClose, onUpdated }){
+function ProfileModal({ user, onClose, onUpdated, onOpenEmailConfig }){
   const [email,setEmail]=useState(user?.email||'');
   const [phone,setPhone]=useState(user?.phone||'');
   const [profile,setProfile]=useState(null);
   const [saved,setSaved]=useState(false);
   const [pw,setPw]=useState({current:'',next:'',confirm:''});
   const [pwMsg,setPwMsg]=useState(null);
+  const [emailCfg,setEmailCfg]=useState(null);
+  const [emailBusy,setEmailBusy]=useState(null); // 'test' | 'sync'
+  const [emailMsg,setEmailMsg]=useState(null);   // {ok,text}
 
   useEffect(()=>{
     (async()=>{
       const res=await apiFetch('/auth/me');
       if(res.success){ setProfile(res.user); setEmail(res.user.email||''); setPhone(res.user.phone||''); }
+      const ec=await apiFetch('/email-config');
+      if(ec.success) setEmailCfg(ec.data);
     })();
   },[]);
+
+  /* Prueba la conexión IMAP/SMTP del propio usuario para saber si está operativo. */
+  async function testEmail(){
+    setEmailBusy('test'); setEmailMsg(null);
+    const res=await apiFetch('/email-config/test',{method:'POST',body:JSON.stringify({})});
+    setEmailMsg(res.success
+      ? {ok:true,text:'Conexión exitosa: tu correo está operativo.'}
+      : {ok:false,text:res.message||'No se pudo conectar con el servidor de correo.'});
+    setEmailBusy(null);
+  }
+
+  /* Sincroniza el buzón del propio usuario. */
+  async function syncEmail(){
+    setEmailBusy('sync'); setEmailMsg(null);
+    const res=await apiFetch('/email-config/sync',{method:'POST',body:JSON.stringify({limit:20})});
+    if(res.success){
+      const d=res.data;
+      setEmailMsg({ok:true,text:`Sincronización correcta: ${d.imported} nuevo(s), ${d.skipped} ya existente(s). Buzón: ${d.total} mensaje(s).`});
+      setEmailCfg(c=>c?{...c,is_active:1}:c);
+    } else {
+      setEmailMsg({ok:false,text:res.message||'Error al sincronizar el correo.'});
+    }
+    setEmailBusy(null);
+  }
 
   async function saveContact(e){
     e.preventDefault();
@@ -3359,6 +3576,45 @@ function ProfileModal({ user, onClose, onUpdated }){
           <input style={styles.input} value={phone} onChange={e=>setPhone(e.target.value)} placeholder="Ej.: 2231-9400"/>
           <button type="submit" style={{...styles.submitBtn,marginTop:4}}>{saved?'✓ Guardado':'Guardar datos de contacto'}</button>
         </form>
+
+        {/* Estado de mi correo — para saber si la sincronización está operativa */}
+        <div style={{marginTop:18,paddingTop:14,borderTop:'1px dashed #e2e8f0'}}>
+          <div style={{fontSize:14,fontWeight:700,color:'#0f172a',marginBottom:8,display:'flex',alignItems:'center',gap:6}}>
+            <Icon name="mail_lock" size={18} color="#64748b"/>Estado de mi correo
+          </div>
+          {emailCfg&&emailCfg.email_address?(
+            <>
+              <div style={{padding:'10px 14px',borderRadius:10,background:'#f8fafc',border:'1px solid #e2e8f0',marginBottom:10,fontSize:13,color:'#475569'}}>
+                <div style={{display:'flex',alignItems:'center',gap:8,marginBottom:4}}>
+                  <span style={{...styles.tagTiny,background:emailCfg.is_active?'#22c55e':'#94a3b8'}}>{emailCfg.is_active?'ACTIVO':'INACTIVO'}</span>
+                  <strong style={{wordBreak:'break-all'}}>{emailCfg.email_address}</strong>
+                </div>
+                <div style={{fontSize:11,color:'#94a3b8'}}>Última sincronización: {emailCfg.last_sync?new Date(emailCfg.last_sync).toLocaleString('es-SV'):'nunca'}</div>
+              </div>
+              <div style={{display:'flex',gap:8}}>
+                <button type="button" onClick={testEmail} disabled={!!emailBusy}
+                  style={{...styles.submitBtn,flex:1,background:'#475569',opacity:emailBusy?0.6:1}}>
+                  {emailBusy==='test'?'Probando...':'Probar conexión'}
+                </button>
+                <button type="button" onClick={syncEmail} disabled={!!emailBusy||!emailCfg.is_active} title={!emailCfg.is_active?'Active su correo en la sección "Correo Electrónico"':''}
+                  style={{...styles.submitBtn,flex:1,background:emailBusy==='sync'?'#475569':'linear-gradient(135deg,#059669,#10b981)',opacity:(!emailCfg.is_active||emailBusy)?0.6:1}}>
+                  {emailBusy==='sync'?'Sincronizando...':'Sincronizar ahora'}
+                </button>
+              </div>
+            </>
+          ):(
+            <div style={{padding:'10px 14px',borderRadius:10,background:'#fffbeb',border:'1px solid #fde68a',fontSize:13,color:'#92400e'}}>
+              Aún no has configurado tu correo.
+              {onOpenEmailConfig&&<button type="button" onClick={onOpenEmailConfig} style={{marginLeft:6,background:'none',border:'none',color:'#2563eb',cursor:'pointer',fontWeight:700,textDecoration:'underline',padding:0,fontSize:13}}>Configurar ahora</button>}
+            </div>
+          )}
+          {emailMsg&&(
+            <div style={{marginTop:10,padding:'10px 14px',borderRadius:10,display:'flex',alignItems:'center',gap:8,background:emailMsg.ok?'#f0fdf4':'#fef2f2',border:`1px solid ${emailMsg.ok?'#86efac':'#fca5a5'}`}}>
+              <Icon name={emailMsg.ok?'cloud_done':'error'} size={20} color={emailMsg.ok?'#22c55e':'#ef4444'}/>
+              <span style={{fontSize:13,color:emailMsg.ok?'#166534':'#991b1b'}}>{emailMsg.text}</span>
+            </div>
+          )}
+        </div>
 
         {/* Cambio de contraseña */}
         <div style={{marginTop:18,paddingTop:14,borderTop:'1px dashed #e2e8f0'}}>
@@ -3536,6 +3792,145 @@ function OnboardingWizard({ user, onFinish }){
   );
 }
 
+/* ══════════════════════════════════════════════════════════════
+   ASISTENTE IA GLOBAL (botón flotante, esquina inferior derecha)
+   Conversa sobre los datos del usuario autenticado: sus correos,
+   sus proyectos, sus alertas y sus solicitudes, más las cifras
+   institucionales de presupuesto y PAC. El backend
+   (/api/assistant/chat) arma el contexto filtrando por el usuario
+   del token, así que nunca alcanza datos de otras personas.
+   ══════════════════════════════════════════════════════════════ */
+function AssistantWidget({ user }){
+  const [open,setOpen]=useState(false);
+  const [msgs,setMsgs]=useState([]);
+  const [input,setInput]=useState('');
+  const [loading,setLoading]=useState(false);
+  const [summary,setSummary]=useState(null);
+  const scrollRef=useRef(null);
+
+  useEffect(()=>{ if(scrollRef.current) scrollRef.current.scrollTop=scrollRef.current.scrollHeight; },[msgs,loading,open]);
+
+  /* Cifras propias para el saludo inicial (solo al abrir por primera vez) */
+  useEffect(()=>{
+    if(!open||summary) return;
+    let cancel=false;
+    apiFetch('/assistant/summary').then(res=>{ if(!cancel&&res.success) setSummary(res.data); });
+    return ()=>{cancel=true;};
+  },[open,summary]);
+
+  async function send(text){
+    const history=[...msgs,{role:'user',text}];
+    setMsgs(history); setInput(''); setLoading(true);
+    const res=await apiFetch('/assistant/chat',{method:'POST',body:JSON.stringify({
+      messages:history.filter(m=>!m.error).map(m=>({role:m.role,text:m.text})),
+    })});
+    setMsgs(prev=>[...prev, res.success
+      ?{role:'assistant',text:res.reply}
+      :{role:'assistant',text:res.message||'No se pudo obtener respuesta',error:true}]);
+    setLoading(false);
+  }
+
+  const SUGGESTIONS=[
+    '¿Qué correos importantes tengo sin leer?',
+    '¿Cuáles de mis proyectos están por vencer?',
+    '¿Cómo va el presupuesto anual de compras?',
+    'Resume el estado de mis proyectos',
+    '¿Qué tengo pendiente esta semana?',
+  ];
+
+  return (
+    <>
+      {!open&&(
+        <button onClick={()=>setOpen(true)} title="Asistente IA — pregunta sobre tus correos, proyectos y presupuesto"
+          style={{position:'fixed',bottom:24,right:24,width:60,height:60,borderRadius:'50%',border:'none',cursor:'pointer',zIndex:1200,
+            background:'linear-gradient(135deg,#3b82f6,#8b5cf6)',boxShadow:'0 8px 25px rgba(59,130,246,0.4)',
+            display:'flex',alignItems:'center',justifyContent:'center'}}>
+          <Icon name="auto_awesome" size={28} color="#fff"/>
+        </button>
+      )}
+      {open&&(
+        <div style={{position:'fixed',bottom:24,right:24,width:390,height:560,zIndex:1200,display:'flex',flexDirection:'column',
+          background:'#fff',borderRadius:18,boxShadow:'0 20px 60px rgba(15,23,42,0.3)',border:'1px solid #e2e8f0',overflow:'hidden'}}>
+          {/* Header */}
+          <div style={{display:'flex',alignItems:'center',gap:10,padding:'12px 16px',background:'linear-gradient(135deg,#0f172a,#1e293b)'}}>
+            <div style={{width:34,height:34,borderRadius:10,background:'linear-gradient(135deg,#3b82f6,#8b5cf6)',display:'flex',alignItems:'center',justifyContent:'center'}}>
+              <Icon name="auto_awesome" size={20} color="#fff"/>
+            </div>
+            <div style={{flex:1,minWidth:0}}>
+              <div style={{fontSize:13,fontWeight:700,color:'#f1f5f9'}}>Asistente IA</div>
+              <div style={{fontSize:11,color:'#94a3b8',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>Tus datos · {user?.name||''}</div>
+            </div>
+            {msgs.length>0&&<button onClick={()=>setMsgs([])} title="Nueva conversación" style={{background:'none',border:'none',cursor:'pointer'}}><Icon name="restart_alt" size={20} color="#94a3b8"/></button>}
+            <button onClick={()=>setOpen(false)} title="Cerrar" style={{background:'none',border:'none',cursor:'pointer'}}><Icon name="close" size={20} color="#94a3b8"/></button>
+          </div>
+
+          {/* Mensajes */}
+          <div ref={scrollRef} style={{flex:1,overflowY:'auto',padding:14,display:'flex',flexDirection:'column',gap:10,background:'#f8fafc'}}>
+            {msgs.length===0&&(
+              <div>
+                <p style={{fontSize:13,color:'#475569',margin:'4px 0 10px'}}>
+                  Hola{user?.name?`, ${String(user.name).split(' ')[0]}`:''}. Pregúntame sobre <strong>tus</strong> correos, proyectos, alertas y solicitudes, o sobre el presupuesto institucional.
+                </p>
+                {summary&&(
+                  <div style={{display:'flex',flexWrap:'wrap',gap:6,marginBottom:12}}>
+                    {[
+                      {l:'correos sin leer',v:summary.correos_sin_leer,c:'#3b82f6'},
+                      {l:'proyectos míos',v:summary.mis_proyectos,c:'#8b5cf6'},
+                      {l:'alertas pendientes',v:summary.alertas_pendientes,c:'#f59e0b'},
+                      {l:'vencen en 7 días',v:summary.vencen_en_7_dias,c:'#ef4444'},
+                    ].map(s=>(
+                      <span key={s.l} style={{fontSize:11,fontWeight:600,color:'#334155',background:'#fff',border:'1px solid #e2e8f0',borderRadius:8,padding:'4px 8px'}}>
+                        <strong style={{color:s.c}}>{s.v}</strong> {s.l}
+                      </span>
+                    ))}
+                  </div>
+                )}
+                {SUGGESTIONS.map(q=>(
+                  <button key={q} onClick={()=>send(q)} style={{display:'block',width:'100%',textAlign:'left',padding:'8px 12px',marginBottom:6,borderRadius:10,
+                    border:'1px solid #bfdbfe',background:'#eff6ff',color:'#1e40af',fontSize:12,fontWeight:600,cursor:'pointer'}}>
+                    {q}
+                  </button>
+                ))}
+                <p style={{fontSize:11,color:'#94a3b8',margin:'10px 0 0',lineHeight:1.5}}>
+                  <Icon name="lock" size={12} color="#94a3b8"/> Solo accede a la información de tu cuenta. No consulta datos de otros usuarios.
+                </p>
+              </div>
+            )}
+            {msgs.map((m,i)=>(
+              <div key={i} style={{alignSelf:m.role==='user'?'flex-end':'flex-start',maxWidth:'85%',
+                padding:'10px 14px',borderRadius:m.role==='user'?'14px 14px 4px 14px':'14px 14px 14px 4px',
+                background:m.role==='user'?'linear-gradient(135deg,#3b82f6,#2563eb)':m.error?'#fef2f2':'#fff',
+                border:m.role==='user'?'none':`1px solid ${m.error?'#fca5a5':'#e2e8f0'}`,
+                color:m.role==='user'?'#fff':m.error?'#991b1b':'#334155',fontSize:13,lineHeight:1.55,whiteSpace:'pre-wrap'}}>
+                {m.text}
+              </div>
+            ))}
+            {loading&&(
+              <div style={{alignSelf:'flex-start',padding:'10px 14px',borderRadius:'14px 14px 14px 4px',background:'#fff',border:'1px solid #e2e8f0',display:'flex',gap:5,alignItems:'center'}}>
+                <span style={{width:7,height:7,borderRadius:'50%',background:'#94a3b8',animation:'pulse 1s infinite'}}/>
+                <span style={{width:7,height:7,borderRadius:'50%',background:'#94a3b8',animation:'pulse 1s infinite 0.2s'}}/>
+                <span style={{width:7,height:7,borderRadius:'50%',background:'#94a3b8',animation:'pulse 1s infinite 0.4s'}}/>
+                <span style={{fontSize:12,color:'#94a3b8',marginLeft:4}}>Revisando tu información...</span>
+              </div>
+            )}
+          </div>
+
+          {/* Input */}
+          <form onSubmit={e=>{e.preventDefault();if(input.trim())send(input.trim());}} style={{display:'flex',gap:8,padding:12,borderTop:'1px solid #e2e8f0',background:'#fff'}}>
+            <input value={input} onChange={e=>setInput(e.target.value)} placeholder="Escriba su pregunta..." disabled={loading}
+              style={{flex:1,padding:'10px 14px',borderRadius:12,border:'1px solid #e2e8f0',fontSize:13,outline:'none'}}/>
+            <button type="submit" disabled={loading||!input.trim()}
+              style={{width:42,height:42,borderRadius:12,border:'none',cursor:'pointer',display:'flex',alignItems:'center',justifyContent:'center',
+                background:loading||!input.trim()?'#cbd5e1':'linear-gradient(135deg,#3b82f6,#8b5cf6)'}}>
+              <Icon name="send" size={20} color="#fff"/>
+            </button>
+          </form>
+        </div>
+      )}
+    </>
+  );
+}
+
 function App(){
   const [user,setUser]=useState(()=>{
     try{ const u=localStorage.getItem(STORAGE_USER); return u?JSON.parse(u):null; }catch{ return null; }
@@ -3632,7 +4027,9 @@ function App(){
     <div style={styles.appContainer}>
       {needsPasswordChange&&<ForcePasswordChange user={user} onChanged={()=>patchUser({must_change_password:false})} onLogout={logout}/>}
       {!needsPasswordChange&&user?.onboarding_done===false&&<OnboardingWizard user={user} onFinish={finishOnboarding}/>}
-      {showProfile&&<ProfileModal user={user} onClose={()=>setShowProfile(false)} onUpdated={patchUser}/>}
+      {showProfile&&<ProfileModal user={user} onClose={()=>setShowProfile(false)} onUpdated={patchUser} onOpenEmailConfig={()=>{setShowProfile(false);setActiveTab('email_config');}}/>}
+      {/* Asistente IA global: se oculta mientras haya un bloqueo (clave temporal u onboarding) */}
+      {!needsPasswordChange&&user?.onboarding_done!==false&&<AssistantWidget user={user}/>}
       <Sidebar activeTab={activeTab} setActiveTab={t=>{setActiveTab(t);if(t==='dashboard')loadStats();}} unreadCount={unreadCount} alertCount={alertCount} collapsed={sidebarCollapsed} setCollapsed={setSidebarCollapsed} userRole={user?.role}/>
       <div style={{flex:1,display:'flex',flexDirection:'column',overflow:'hidden'}}>
         {/* Banner de sesión impersonada */}
@@ -3659,7 +4056,7 @@ function App(){
               <Icon name="notifications" size={24} color="#64748b"/>
               {alertCount>0 && <span style={styles.topBadge}>{alertCount}</span>}
             </button>
-            <div onClick={()=>setShowProfile(true)} style={{...styles.userChip,cursor:'pointer'}} title="Mi Perfil — datos de contacto y contraseña">
+            <div onClick={()=>setShowProfile(true)} style={{...styles.userChip,cursor:'pointer'}} title="Mi Perfil — datos de contacto, correo y contraseña">
               <div style={{width:32,height:32,borderRadius:'50%',background:'#1e40af',display:'flex',alignItems:'center',justifyContent:'center',color:'#fff',fontWeight:700,fontSize:14}}>
                 {(user?.name||'?')[0]}
               </div>

@@ -1,6 +1,7 @@
 import bcrypt from 'bcryptjs';
 import { get, run } from './db.js';
 import { config } from './config.js';
+import { encryptField } from './services/fieldCrypto.js';
 
 /* Las unidades van primero: users.unit_id las referencia y SQL Server sí valida FKs. */
 
@@ -16,7 +17,7 @@ async function seedUnits() {
     ['Unidad de Adquisiciones (UACP)', 'UACP-001', 'Unidad de Adquisiciones y Contrataciones Públicas', 'Jefe UACP', 'uacp@pgr.gob.sv', '2231-9405'],
   ];
   for (const [name, code, desc, resp, email, phone] of units) {
-    await run('INSERT INTO units(name,code,description,responsible_name,email,phone) VALUES(?,?,?,?,?,?)', [name, code, desc, resp, email, phone]);
+    await run('INSERT INTO units(name,code,description,responsible_name,email,phone) VALUES(?,?,?,?,?,?)', [name, code, desc, resp, encryptField(email), phone]);
   }
 }
 
@@ -57,7 +58,7 @@ export async function ensureAdmin() {
   if (ex) return;
   const hash = await bcrypt.hash(config.admin.password, 10);
   await run('INSERT INTO users(name,document_type,document_number,email,password_hash,role,unit_id,is_active,avatar_color) VALUES(?,?,?,?,?,?,?,1,?)',
-    ['Administrador PGR', 'DUI', config.admin.documentNumber, 'admin@pgr.gob.sv', hash, 'admin', 1, '#1e40af']);
+    ['Administrador PGR', 'DUI', config.admin.documentNumber, encryptField('admin@pgr.gob.sv'), hash, 'admin', 1, '#1e40af']);
 }
 
 async function seedUsers() {
@@ -74,7 +75,7 @@ async function seedUsers() {
   ];
   for (const [name, doc, email, role, uid, color] of users) {
     await run('INSERT INTO users(name,document_type,document_number,email,password_hash,role,unit_id,is_active,avatar_color) VALUES(?,?,?,?,?,?,?,1,?)',
-      [name, 'DUI', doc, email, pwd, role, uid, color]);
+      [name, 'DUI', doc, encryptField(email), pwd, role, uid, color]);
   }
 }
 
@@ -320,7 +321,7 @@ async function seedEmailConfig() {
   ];
   for (const [uid, email, ihost, iport, isec, shost, sport, ssec, prov, active] of configs) {
     await run('INSERT INTO user_email_config(user_id,email_address,imap_host,imap_port,imap_secure,smtp_host,smtp_port,smtp_secure,provider,is_active) VALUES(?,?,?,?,?,?,?,?,?,?)',
-      [uid, email, ihost, iport, isec, shost, sport, ssec, prov, active]);
+      [uid, encryptField(email), ihost, iport, isec, shost, sport, ssec, prov, active]);
   }
 }
 

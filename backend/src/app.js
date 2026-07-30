@@ -13,6 +13,7 @@ import alertsRoutes from './routes/alerts.routes.js';
 import adminRoutes from './routes/admin.routes.js';
 import emailConfigRoutes from './routes/emailConfig.routes.js';
 import pacRoutes from './routes/pac.routes.js';
+import assistantRoutes from './routes/assistant.routes.js';
 import { auditMiddleware } from './services/audit.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -40,6 +41,7 @@ export function createApp() {
   app.use('/api/admin', adminRoutes);
   app.use('/api/email-config', emailConfigRoutes);
   app.use('/api/pac', pacRoutes);
+  app.use('/api/assistant', assistantRoutes);
 
   /* ── Frontend estático en producción ── */
   app.use(express.static(path.join(__dirname, '..', '..', 'frontend', 'dist')));

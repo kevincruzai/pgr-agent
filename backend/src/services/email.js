@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { all, get, run } from '../db.js';
 import { config } from '../config.js';
 import { classifyCorrespondence } from './gemini.js';
+import { encryptField, decryptField } from './fieldCrypto.js';
 
 const ATTACHMENTS_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..', 'storage', 'attachments');
 fs.mkdirSync(ATTACHMENTS_DIR, { recursive: true });
@@ -152,7 +153,7 @@ export async function syncInbox(userId, { limit = 0 } = {}) {
 
           const r = await run(`INSERT INTO correspondences(subject,body,from_user_id,to_user_id,label,external_from,imap_uid,ai_category,ai_priority,ai_summary,created_at)
             VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
-            [subject, body, null, userId, 'inbox', fromText, uidKey,
+            [subject, body, null, userId, 'inbox', encryptField(fromText), uidKey,
              ai?.category || '', ai?.priority || '', ai?.summary || '',
              parsed.date ? parsed.date.toISOString().slice(0, 19).replace('T', ' ') : null]);
 
@@ -169,6 +170,37 @@ export async function syncInbox(userId, { limit = 0 } = {}) {
       }
       await run('UPDATE user_email_config SET last_sync=SYSDATETIME() WHERE user_id=?', [userId]);
       return { imported, skipped, classified, total, pending: pendingUids.length - toImport.length };
+    } finally {
+      lock.release();
+    }
+  } finally {
+    try { await client.logout(); } catch { /* conexión ya cerrada */ }
+  }
+}
+
+/** Estado del buzón de un usuario: total en el servidor, ya importados y
+    PENDIENTES (en cola). Solo lectura — no importa nada; se usa para el
+    indicador de la bandeja de entrada. */
+export async function getInboxStatus(userId) {
+  const cfg = await get('SELECT * FROM user_email_config WHERE user_id=?', [userId]);
+  if (!cfg) return { configured: false, active: false, total: 0, imported: 0, pending: 0, last_sync: null };
+  const base = { configured: true, active: !!cfg.is_active, last_sync: cfg.last_sync || null };
+  if (!cfg.is_active || !cfg.imap_host) return { ...base, total: 0, imported: 0, pending: 0 };
+
+  const client = imapClient(cfg);
+  await client.connect();
+  try {
+    const lock = await client.getMailboxLock('INBOX', { readOnly: true });
+    try {
+      const total = client.mailbox.exists || 0;
+      if (total === 0) return { ...base, total: 0, imported: 0, pending: 0 };
+      const existingRows = await all('SELECT imap_uid FROM correspondences WHERE to_user_id=? AND imap_uid IS NOT NULL', [userId]);
+      const existing = new Set(existingRows.map(r => r.imap_uid));
+      let imported = 0;
+      for await (const m of client.fetch('1:*', { uid: true })) {
+        if (existing.has(`${cfg.email_address}:${m.uid}`)) imported++;
+      }
+      return { ...base, total, imported, pending: Math.max(0, total - imported) };
     } finally {
       lock.release();
     }
@@ -206,6 +238,79 @@ export async function syncAllInboxes({ limit = 0 } = {}) {
     para no romper a quienes la importan. */
 export async function sendExternalEmail() {
   throw new Error('Envío de correo deshabilitado: el sistema es de solo consulta (no envía ni modifica correos).');
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   Correo institucional "No-Reply" (transaccional del sistema)
+   Se usa SOLO para correos que genera el propio sistema —p. ej. enviar
+   una contraseña temporal al usuario— desde una cuenta configurada por
+   el administrador. Es independiente del buzón IMAP de cada usuario.
+   ══════════════════════════════════════════════════════════════════ */
+
+/** Lee la configuración del correo no-reply (tabla settings). La contraseña
+    se guarda cifrada; la capa de lectura la descifra (decryptField es idempotente). */
+export async function getNoreplyConfig() {
+  const rows = await all("SELECT [key], value FROM settings WHERE [key] LIKE 'noreply_%'");
+  const s = {};
+  rows.forEach(r => { s[r.key] = r.value; });
+  return {
+    host: s.noreply_smtp_host || '',
+    port: Number(s.noreply_smtp_port) || 587,
+    secure: s.noreply_smtp_secure === 'true',
+    user: s.noreply_smtp_user || '',
+    pass: decryptField(s.noreply_smtp_pass || ''),
+    fromName: s.noreply_from_name || 'PGR Compras Públicas',
+    fromEmail: s.noreply_from_email || s.noreply_smtp_user || '',
+    enabled: s.noreply_enabled === 'true',
+  };
+}
+
+function noreplyTransport(cfg) {
+  const port = Number(cfg.port) || 587;
+  return nodemailer.createTransport({
+    host: cfg.host,
+    port,
+    secure: cfg.secure || port === 465, // 465 = TLS implícito; 587 = STARTTLS
+    auth: cfg.user ? { user: cfg.user, pass: cfg.pass } : undefined,
+    connectionTimeout: 15000,
+    greetingTimeout: 15000,
+    tls: tlsOptions,
+  });
+}
+
+/** Envía un correo transaccional del sistema desde la cuenta no-reply configurada. */
+export async function sendSystemMail({ to, subject, text, html }) {
+  const cfg = await getNoreplyConfig();
+  if (!cfg.enabled) throw new Error('El correo no-reply no está activado. Configúrelo en Configuración → Correo No-Reply.');
+  if (!cfg.host || !cfg.fromEmail) throw new Error('Falta configurar el servidor SMTP o el remitente del correo no-reply.');
+  if (!to) throw new Error('El usuario no tiene correo registrado.');
+  const from = cfg.fromName ? `"${cfg.fromName}" <${cfg.fromEmail}>` : cfg.fromEmail;
+  const info = await noreplyTransport(cfg).sendMail({ from, to, subject, text, html, replyTo: cfg.fromEmail });
+  return { messageId: info.messageId, accepted: info.accepted };
+}
+
+/** Envía un correo de prueba con la configuración dada (mezcla overrides del
+    formulario con lo guardado). No exige que el no-reply esté activado. */
+export async function sendNoreplyTest(override = {}, to) {
+  const saved = await getNoreplyConfig();
+  const cfg = {
+    host: override.host ?? saved.host,
+    port: Number(override.port) || saved.port,
+    secure: override.secure !== undefined ? !!override.secure : saved.secure,
+    user: override.user ?? saved.user,
+    pass: override.pass ? override.pass : saved.pass, // si el form no trae clave, usa la guardada
+    fromName: override.fromName ?? saved.fromName,
+    fromEmail: override.fromEmail ?? saved.fromEmail,
+  };
+  if (!cfg.host || !cfg.fromEmail) throw new Error('Configure el servidor SMTP y el remitente antes de probar.');
+  const dest = to || cfg.fromEmail;
+  const from = cfg.fromName ? `"${cfg.fromName}" <${cfg.fromEmail}>` : cfg.fromEmail;
+  await noreplyTransport(cfg).sendMail({
+    from, to: dest,
+    subject: 'Prueba de correo No-Reply — PGR Compras Públicas',
+    text: 'Este es un correo de prueba del sistema PGR Compras Públicas. Si lo recibió, la configuración no-reply funciona correctamente.',
+  });
+  return { to: dest };
 }
 
 export async function getUsersDirectory() {

@@ -6,8 +6,11 @@
     "dev": "node --use-system-ca --watch server.js",
     "start": "node --use-system-ca server.js",
     "seed": "node src/seed.js",
-    "test": "node --use-system-ca --test --test-concurrency=1 \"test/*.test.js\"",
-    "db:schema": "sqlcmd -S localhost\\SQLEXPRESS -E -C -b -i sql/001_schema.sql && sqlcmd -S localhost\\SQLEXPRESS -E -C -b -i sql/002_email_import.sql && sqlcmd -S localhost\\SQLEXPRESS -E -C -b -i sql/003_project_dates.sql && sqlcmd -S localhost\\SQLEXPRESS -E -C -b -i sql/004_attachments.sql && sqlcmd -S localhost\\SQLEXPRESS -E -C -b -i sql/005_pac_lcp.sql && sqlcmd -S localhost\\SQLEXPRESS -E -C -b -i sql/006_onboarding.sql && sqlcmd -S localhost\\SQLEXPRESS -E -C -b -i sql/007_user_profile.sql && sqlcmd -S localhost\\SQLEXPRESS -E -C -b -i sql/008_audit_log.sql"
+    "encrypt-emails": "node --use-system-ca src/encrypt-emails.js",
+    "verify-encryption": "node --use-system-ca verificar-cifrado.mjs",
+    "test": "node --use-system-ca --env-file=.env.test --test --test-concurrency=1 \"test/*.test.js\"",
+    "test:db": "node --use-system-ca --env-file=.env.test src/setup-test-db.js",
+    "db:schema": "sqlcmd -S localhost\\SQLEXPRESS -E -C -b -i sql/001_schema.sql && sqlcmd -S localhost\\SQLEXPRESS -E -C -b -i sql/002_email_import.sql && sqlcmd -S localhost\\SQLEXPRESS -E -C -b -i sql/003_project_dates.sql && sqlcmd -S localhost\\SQLEXPRESS -E -C -b -i sql/004_attachments.sql && sqlcmd -S localhost\\SQLEXPRESS -E -C -b -i sql/005_pac_lcp.sql && sqlcmd -S localhost\\SQLEXPRESS -E -C -b -i sql/006_onboarding.sql && sqlcmd -S localhost\\SQLEXPRESS -E -C -b -i sql/007_user_profile.sql && sqlcmd -S localhost\\SQLEXPRESS -E -C -b -i sql/008_audit_log.sql && sqlcmd -S localhost\\SQLEXPRESS -E -C -b -i sql/009_encrypt_email_columns.sql"
   },
   "dependencies": {
     "bcryptjs": "^3.0.2",

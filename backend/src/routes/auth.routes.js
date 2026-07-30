@@ -3,6 +3,7 @@ import bcrypt from 'bcryptjs';
 import { all, get, run } from '../db.js';
 import { signToken, requireAuth } from '../middleware/auth.js';
 import { auditFromReq } from '../services/audit.js';
+import { encryptField } from '../services/fieldCrypto.js';
 
 const router = Router();
 
@@ -52,7 +53,7 @@ router.post('/register', async (req, res) => {
   const hash = await bcrypt.hash(password, 10);
   const r = await run(
     'INSERT INTO users(name,document_type,document_number,email,password_hash,role,unit_id,is_active) VALUES(?,?,?,?,?,?,?,1)',
-    [name, document_type || 'DUI', String(document_number), String(email || ''), hash, 'solicitante', unit_id || null]
+    [name, document_type || 'DUI', String(document_number), encryptField(String(email || '')), hash, 'solicitante', unit_id || null]
   );
   res.json({ success: true, id: r.lastID });
 });
@@ -90,7 +91,7 @@ router.post('/change-password', requireAuth, async (req, res) => {
 router.put('/profile', requireAuth, async (req, res) => {
   const { email, phone } = req.body || {};
   await run('UPDATE users SET email=?, phone=? WHERE id=?',
-    [String(email || '').slice(0, 190), String(phone || '').slice(0, 45), req.user.id]);
+    [encryptField(String(email || '').slice(0, 190)), String(phone || '').slice(0, 45), req.user.id]);
   res.json({ success: true });
 });
 

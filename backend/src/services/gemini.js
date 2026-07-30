@@ -86,6 +86,37 @@ ${JSON.stringify(projectContext).slice(0, 18000)}`;
   return requestGemini({ ...cfg, temperature: 0.4, maxTokens: Math.max(cfg.maxTokens, 1536) }, contents, { systemInstruction });
 }
 
+/**
+ * Chat multi-turno con el espacio de trabajo del usuario (correos, proyectos,
+ * alertas y solicitudes propios + agregados institucionales de presupuesto/PAC).
+ * El aislamiento por usuario lo garantiza quien arma `workspaceContext`
+ * (assistant.routes.js); aquí solo se instruye al modelo a no salirse de él.
+ * history: [{role:'user'|'assistant', text}]
+ */
+export async function chatWithWorkspace(workspaceContext, history) {
+  const cfg = await getGeminiSettings();
+  if (!cfg.enabled || !cfg.apiKey) return null;
+  const systemInstruction = `Eres el asistente personal de trabajo dentro del sistema de la Unidad de Adquisiciones y Contrataciones Públicas (UACP) de la Procuraduría General de la República de El Salvador, alineado a la Ley de Compras Públicas (LCP, DL 652/2023), su ente rector DINAC y COMPRASAL.
+
+Responde SIEMPRE en español, de forma breve y directa (máximo ~150 palabras salvo que pidan detalle o una lista).
+
+REGLA CRÍTICA DE ALCANCE: el contexto de abajo contiene ÚNICAMENTE los datos del usuario que te pregunta (sus correos, sus proyectos, sus alertas y sus solicitudes) más cifras institucionales agregadas (presupuesto anual y PAC). Basa tus respuestas EXCLUSIVAMENTE en ese contexto.
+- Nunca inventes ni supongas datos de otros usuarios, ni afirmes conocer proyectos o correos que no aparezcan aquí.
+- Si te preguntan por información de otra persona o por algo que no está en el contexto, responde que no tienes acceso a esos datos y sugiere consultarlo con la UACP.
+- Las cifras de presupuesto y PAC son totales institucionales compartidos: puedes citarlas como tales, pero no dispones del desglose por proyecto ajeno.
+
+Cuando cites correos, proyectos o montos, usa nombres, códigos y fechas concretos del contexto. Si algo no consta, dilo claramente en lugar de inventarlo.
+La fecha de hoy es ${new Date().toISOString().slice(0, 10)}.
+
+CONTEXTO DEL USUARIO (JSON):
+${JSON.stringify(workspaceContext).slice(0, 24000)}`;
+  const contents = history.slice(-12).map(h => ({
+    role: h.role === 'assistant' ? 'model' : 'user',
+    parts: [{ text: String(h.text || '').slice(0, 2000) }],
+  }));
+  return requestGemini({ ...cfg, temperature: 0.4, maxTokens: Math.max(cfg.maxTokens, 1536) }, contents, { systemInstruction });
+}
+
 /** Análisis ejecutivo IA de los riesgos de vencimiento detectados por el escáner de alertas. */
 export async function summarizeDeadlineRisks(risks) {
   const cfg = await getGeminiSettings();
