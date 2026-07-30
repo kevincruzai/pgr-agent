@@ -1,0 +1,28 @@
+# Unidad systemd para el backend PGR en Linux (Compute Engine / on-premise)
+# Instalación:
+#   sudo cp deploy/pgr-backend.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now pgr-backend
+[Unit]
+Description=PGR Sistema de Compras Publicas UACP (backend Node.js)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pgrapp
+Group=pgrapp
+WorkingDirectory=/opt/pgr/backend
+# Variables sensibles en /opt/pgr/backend/.env (cargadas por dotenv)
+Environment=NODE_ENV=production
+ExecStart=/usr/bin/node --use-system-ca server.js
+Restart=always
+RestartSec=5
+# Endurecimiento básico
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/opt/pgr
+
+[Install]
+WantedBy=multi-user.target

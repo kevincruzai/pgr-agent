@@ -1,0 +1,31 @@
+<service>
+	<id>pgrcompraspublicas.exe</id>
+	<name>PGR Compras Publicas</name>
+	<description>Sistema de Compras Publicas UACP - PGR. Backend API + frontend (PWA) en http://localhost:3621</description>
+	<executable>C:\Program Files\nodejs\node.exe</executable>
+	<argument>--use-system-ca</argument>
+	<argument>C:\Services\PGR\backend\node_modules\node-windows\lib\wrapper.js</argument>
+	<argument>--file</argument>
+	<argument>C:\Services\PGR\backend\server.js</argument>
+	<argument>--scriptoptions=</argument>
+	<argument>--log</argument>
+	<argument>PGR Compras Publicas wrapper</argument>
+	<argument>--grow</argument>
+	<argument>0.5</argument>
+	<argument>--wait</argument>
+	<argument>2</argument>
+	<argument>--maxrestarts</argument>
+	<argument>20</argument>
+	<argument>--abortonerror</argument>
+	<argument>n</argument>
+	<argument>--stopparentfirst</argument>
+	<argument>undefined</argument>
+	<logmode>rotate</logmode>
+	<stoptimeout>30sec</stoptimeout>
+	<serviceaccount>
+		<domain>GCP-SRV-GUCUMAT</domain>
+		<user>LocalSystem</user>
+		<password></password>
+	</serviceaccount>
+	<workingdirectory>C:\Services\PGR\backend</workingdirectory>
+</service>
