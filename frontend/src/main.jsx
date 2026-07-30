@@ -580,18 +580,42 @@ function InboxView({ starred }){
     setInboxStatus(res.success?res.data:null);
   },[]);
 
+  /* La sincronización de un buzón grande tarda minutos: el backend descarga el
+     lote y luego inserta los correos UNO A UNO (email.js, fase 2). Como esas
+     filas ya están en la base mientras el POST sigue abierto, sondeamos la
+     bandeja durante la espera y los correos van apareciendo en vivo en vez de
+     todos de golpe al final.
+       - La lista se relee cada 3 s: es solo una consulta a la base, barata.
+       - El contador "en cola" viene de /status, que abre una sesión IMAP; ese
+         se refresca cada 30 s para no castigar al servidor de correo. */
   async function syncNow(){
     setSyncing(true); setSyncMsg(null);
-    // limit:0 → sincronización COMPLETA: trae todos los correos pendientes del buzón.
-    const res=await apiFetch('/email-config/sync',{method:'POST',body:JSON.stringify({limit:0})});
-    if(res.success){
-      const d=res.data;
-      setSyncMsg({ok:true,text:d.imported>0
-        ? `${d.imported} correo(s) importado(s). ${d.pending>0?`Quedan ${d.pending} en cola.`:'Bandeja al día.'}`
-        : `No hay correos nuevos. ${d.pending>0?`${d.pending} en cola.`:'Bandeja al día.'}`});
+    const base = await loadInbox(true);
+    let done = false, ticks = 0;
+    const timer = setInterval(async()=>{
+      const n = await loadInbox(true);
+      ticks++;
+      if(ticks % 10 === 0) loadStatus();
+      // Si el POST ya terminó, no pisar el mensaje final con uno de progreso.
+      if(done) return;
+      if(n!=null && base!=null && n>base) setSyncMsg({ok:true,text:`Sincronizando… ${n-base} correo(s) recibido(s).`});
+    },3000);
+    try{
+      // limit:0 → sincronización COMPLETA: trae todos los correos pendientes del buzón.
+      const res=await apiFetch('/email-config/sync',{method:'POST',body:JSON.stringify({limit:0})});
+      done = true;
+      if(res.success){
+        const d=res.data;
+        setSyncMsg({ok:true,text:d.imported>0
+          ? `${d.imported} correo(s) importado(s). ${d.pending>0?`Quedan ${d.pending} en cola.`:'Bandeja al día.'}`
+          : `No hay correos nuevos. ${d.pending>0?`${d.pending} en cola.`:'Bandeja al día.'}`});
+      } else setSyncMsg({ok:false,text:res.message||'Error al sincronizar'});
+    } finally {
+      done = true;
+      clearInterval(timer);
       loadInbox(); loadStatus();
-    } else setSyncMsg({ok:false,text:res.message||'Error al sincronizar'});
-    setSyncing(false);
+      setSyncing(false);
+    }
   }
 
   async function analyzeThreadAI(projectId,e){
@@ -601,8 +625,12 @@ function InboxView({ starred }){
     setThreadAnalysis(p=>({...p,[projectId]:res.success?{data:res.data}:{error:res.message||'Error al analizar'}}));
   }
 
-  const loadInbox = useCallback(async ()=>{
-    setLoading(true);
+  /* `silent`: refresca sin levantar el spinner de carga. Lo usa el sondeo
+     durante la sincronización, que se repite cada pocos segundos y haría
+     parpadear la vista entera en cada vuelta. Devuelve el total en base para
+     que quien sondea pueda calcular cuántos correos han entrado. */
+  const loadInbox = useCallback(async (silent=false)=>{
+    if(!silent) setLoading(true);
     const qs = new URLSearchParams();
     if(starred) qs.set('is_starred','1');
     if(search) qs.set('search',search);
@@ -610,7 +638,8 @@ function InboxView({ starred }){
     qs.set('pageSize','25');
     const res = await apiFetch(`/correspondences?${qs.toString()}`);
     if(res.success){ setEmails(res.data); setPageInfo({total:res.total||0,totalPages:res.totalPages||1,pageSize:res.pageSize||25}); }
-    setLoading(false);
+    if(!silent) setLoading(false);
+    return res.success ? (res.total||0) : null;
   },[starred,search,page]);
 
   // Volver a la página 1 al cambiar la búsqueda o el filtro de destacados.
@@ -3942,9 +3971,12 @@ function AssistantWidget({ user }){
 
   return (
     <>
+      {/* bottom:88 y no 24: la paginación de la bandeja va alineada a la derecha
+          y mide ~58px de alto, así que a 24 el botón se le montaba encima al
+          llegar al final de la lista (ver InboxView, fila de paginación). */}
       {!open&&(
         <button onClick={()=>setOpen(true)} title="Asistente IA — pregunta sobre tus correos, proyectos y presupuesto"
-          style={{position:'fixed',bottom:24,right:24,width:60,height:60,borderRadius:'50%',border:'none',cursor:'pointer',zIndex:1200,
+          style={{position:'fixed',bottom:88,right:24,width:60,height:60,borderRadius:'50%',border:'none',cursor:'pointer',zIndex:1200,
             background:'linear-gradient(135deg,#3b82f6,#8b5cf6)',boxShadow:'0 8px 25px rgba(59,130,246,0.4)',
             display:'flex',alignItems:'center',justifyContent:'center'}}>
           <Icon name="auto_awesome" size={28} color="#fff"/>
