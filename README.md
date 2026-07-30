@@ -89,7 +89,7 @@ Para instalar en **Google Cloud Platform** (Compute Engine o Cloud Run + Cloud S
 ```bash
 # 1. Crear la base de datos y el esquema
 cd backend
-npm run db:schema        # ejecuta sql/001..008 contra localhost\SQLEXPRESS (idempotente, usa -C)
+npm run db:schema        # ejecuta sql/001..009 contra localhost\SQLEXPRESS (idempotente, usa -C)
 
 # 2. Configurar variables de entorno
 cp .env.example .env     # ajustar JWT_SECRET, credenciales de BD, etc.
@@ -108,6 +108,41 @@ En Windows también puede usarse `iniciar.bat` desde la raíz del proyecto.
 > 📘 Guía completa de SQL Server (instalación, modo mixto, TCP/IP, respaldos, troubleshooting):
 > [GUIA_CONFIGURACION_SQL_SERVER.md](GUIA_CONFIGURACION_SQL_SERVER.md) ·
 > versión Word: `Guia_Configuracion_SQL_Server_PGR_v1.docx` (se regenera con `python gen_guia_sql_docx.py`)
+
+## Servicio Windows (producción local)
+
+En el servidor, el backend corre como **servicio de Windows** llamado **PGR Compras Publicas**
+(arranque automático, cuenta `LocalSystem`), gestionado con `node-windows`. Ese mismo proceso
+sirve el **frontend en el puerto 80** y la **API/backend en el 3621**.
+
+> ⚠️ **`backend/daemon/pgrcompraspublicas.exe` es solo un *lanzador*, no contiene el código.**
+> Según su configuración (`daemon/pgrcompraspublicas.xml`) ejecuta `node server.js`. Por eso, para
+> aplicar cambios de código **NO se regenera el `.exe`: basta con REINICIAR el servicio**, que vuelve
+> a leer `server.js` y `src/` frescos (y sirve el `frontend/dist` recompilado). Regenerar el `.exe`
+> no cambiaría nada del código.
+
+Operaciones (consola **como Administrador**):
+
+```powershell
+# Reiniciar → aplica los cambios de código ya guardados en disco
+Restart-Service -Name 'pgrcompraspublicas.exe' -Force
+
+# Instalar / desinstalar el servicio (regenera el lanzador; rara vez necesario)
+cd C:\Services\PGR\backend
+node service-install.cjs      # instala y arranca
+node service-uninstall.cjs    # detiene y desinstala
+```
+
+### Despliegue completo en un clic
+
+`deploy/actualizar-local.bat` (doble clic → aceptar UAC) deja "todo al día", en orden:
+reglas de firewall (80/3621) → migración `009` → **reinicio del servicio** → cifrado de los correos
+existentes → verificación de puertos. Comprobar que quedó operativo:
+
+```powershell
+cd C:\Services\PGR\backend
+npm run verify-encryption     # ✅ OPERATIVO cuando el cifrado en reposo está activo
+```
 
 ## Configuración de base de datos (`backend/.env`)
 
@@ -183,8 +218,8 @@ backend/
 
 ## Puertos
 
-- **Backend API**: `http://localhost:3621`
-- **Frontend**: `http://localhost:5176`
+- **Desarrollo** — Backend API: `http://localhost:3621` · Frontend (Vite): `http://localhost:5176`
+- **Producción (servicio Windows)** — Frontend: `http://<servidor>:80` · Backend/API: `http://<servidor>:3621` (mismo proceso Node)
 
 ## Credenciales Admin (desarrollo)
 

@@ -38,12 +38,28 @@ const PAC_METHOD_LABELS = { licitacion_competitiva:'Licitación Competitiva', co
 const PAC_STATUS = { programado:{l:'Programado',c:'#94a3b8'}, en_proceso:{l:'En Proceso',c:'#f59e0b'}, contratado:{l:'Contratado',c:'#22c55e'}, desierto:{l:'Desierto',c:'#8b5cf6'}, cancelado:{l:'Cancelado',c:'#ef4444'} };
 const MONTHS_ES = ['','Enero','Febrero','Marzo','Abril','Mayo','Junio','Julio','Agosto','Septiembre','Octubre','Noviembre','Diciembre'];
 
+/* Siempre resuelve a un objeto {success,...}: la red caída o una respuesta que no
+   sea JSON (p. ej. el HTML de un 404 de Express cuando el backend corre una
+   versión vieja sin la ruta) devolvían una excepción que dejaba las pantallas
+   colgadas en "Cargando..." sin decir por qué. */
 async function apiFetch(path, opts={}){
   const token = localStorage.getItem(STORAGE_TOKEN);
   const headers = { 'Content-Type':'application/json', ...(token ? { Authorization:`Bearer ${token}` } : {}) };
-  const res = await fetch(`${API}${path}`, { ...opts, headers });
+  let res;
+  try {
+    res = await fetch(`${API}${path}`, { ...opts, headers });
+  } catch {
+    return { success:false, message:'No se pudo contactar al servidor. Verifique que el backend esté en ejecución.' };
+  }
   if(res.status===401){ localStorage.removeItem(STORAGE_TOKEN); localStorage.removeItem(STORAGE_USER); window.location.reload(); }
-  return res.json();
+  const body = await res.text();
+  try {
+    return JSON.parse(body);
+  } catch {
+    return { success:false, message: res.status===404
+      ? `La ruta ${path} no existe en el servidor (404). Es probable que el backend esté corriendo una versión anterior: reinícielo.`
+      : `Respuesta inválida del servidor (HTTP ${res.status}).` };
+  }
 }
 
 function formatCurrency(n){ return new Intl.NumberFormat('en-US',{style:'currency',currency:'USD'}).format(n||0); }
@@ -554,6 +570,9 @@ function InboxView({ starred }){
   const [syncing,setSyncing]=useState(false);
   const [inboxStatus,setInboxStatus]=useState(null); // {configured,active,total,imported,pending,last_sync}
   const [syncMsg,setSyncMsg]=useState(null);          // {ok,text}
+  const [grouping,setGrouping]=useState(false);
+  const [groupMsg,setGroupMsg]=useState(null);        // {ok,text}
+  const [projectList,setProjectList]=useState([]);    // para reasignar un correo a mano
 
   const loadStatus=useCallback(async()=>{
     // Consulta el buzón IMAP para saber cuántos correos faltan por sincronizar.
@@ -601,8 +620,33 @@ function InboxView({ starred }){
     setLoading(true);
     const res = await apiFetch('/correspondences/by-project');
     if(res.success){setThreads(res.data.threads||[]);setUngrouped(res.data.ungrouped||[]);}
+    const pr = await apiFetch('/projects');
+    if(pr.success) setProjectList(pr.data||[]);
     setLoading(false);
   },[]);
+
+  /* Agrupación IA real: Gemini lee los correos sin expediente, los organiza por
+     proceso de adquisición, crea los expedientes que falten y los vincula. */
+  async function autoGroup(){
+    setGrouping(true); setGroupMsg(null);
+    const res = await apiFetch('/correspondences/auto-group',{method:'POST',body:JSON.stringify({limit:120})});
+    if(res.success){
+      const d=res.data;
+      const aviso=(d.errors&&d.errors.length)?` ⚠ ${d.errors.length} lote(s) no se pudieron analizar: ${d.errors[0]}`:'';
+      setGroupMsg({ok:true,text:(d.emails_linked>0
+        ? `${d.analyzed} correo(s) analizado(s): ${d.emails_linked} agrupado(s) en ${d.groups.length} expediente(s) (${d.projects_created} nuevo(s)). ${d.unassigned} sin relación con una adquisición.`
+        : `${d.analyzed} correo(s) analizado(s). La IA no encontró expedientes que formar: ninguno corresponde a un proceso de adquisición.`)+aviso});
+      await loadThreads();
+    } else setGroupMsg({ok:false,text:res.message||'Error al agrupar'});
+    setGrouping(false);
+  }
+
+  /* Gestión manual: mover un correo a otro expediente (o sacarlo). */
+  async function assignProject(corrId,projectId){
+    const res = await apiFetch(`/correspondences/${corrId}/project`,{method:'PUT',body:JSON.stringify({project_id:projectId||null})});
+    if(res.success) loadThreads();
+    else setGroupMsg({ok:false,text:res.message||'No se pudo mover el correo'});
+  }
 
   useEffect(()=>{
     if(viewMode==='inbox') loadInbox();
@@ -627,6 +671,10 @@ function InboxView({ starred }){
     if(!email.is_read) await apiFetch(`/correspondences/${email.id}/read`,{method:'PUT'});
     setSelected(email);
     setAttachments([]);
+    /* El listado ya no trae el cuerpo (era demasiado pesado): se pide aquí el
+       correo completo. Marca leído en el servidor y devuelve body. */
+    const full = await apiFetch(`/correspondences/${email.id}`);
+    if(full.success) setSelected(full.data);
     const res = await apiFetch(`/correspondences/${email.id}/attachments`);
     if(res.success) setAttachments(res.data||[]);
   }
@@ -743,10 +791,29 @@ function InboxView({ starred }){
       viewMode==='threads'?(
         <div>
           {/* AI grouping header */}
-          <div style={{display:'flex',alignItems:'center',gap:8,marginBottom:16,padding:'12px 16px',background:'linear-gradient(135deg,#0f172a,#1e293b)',borderRadius:12}}>
-            <Icon name="psychology" size={22} color="#60a5fa"/>
-            <span style={{fontSize:14,fontWeight:600,color:'#f1f5f9'}}>Agrupación Inteligente por Proyecto</span>
-            <span style={{fontSize:12,color:'#94a3b8',marginLeft:8}}>Gemini Pro analizó el contexto de {threads.reduce((a,t)=>a+t.messages.length,0)+ungrouped.length} correos → {threads.length} cadenas identificadas</span>
+          <div style={{marginBottom:16,padding:'12px 16px',background:'linear-gradient(135deg,#0f172a,#1e293b)',borderRadius:12}}>
+            <div style={{display:'flex',alignItems:'center',gap:8}}>
+              <Icon name="psychology" size={22} color="#60a5fa"/>
+              <div style={{flex:1,minWidth:0}}>
+                <div style={{fontSize:14,fontWeight:600,color:'#f1f5f9'}}>Agrupación Inteligente por Proyecto</div>
+                <div style={{fontSize:12,color:'#94a3b8'}}>
+                  {threads.reduce((a,t)=>a+t.messages.length,0)} correo(s) agrupado(s) en {threads.length} expediente(s)
+                  {ungrouped.length>0 && ` · ${ungrouped.length} sin expediente`}
+                </div>
+              </div>
+              <button onClick={autoGroup} disabled={grouping||ungrouped.length===0}
+                style={{padding:'8px 14px',borderRadius:9,border:'none',fontSize:13,fontWeight:600,display:'flex',alignItems:'center',gap:6,flexShrink:0,
+                  cursor:(grouping||ungrouped.length===0)?'default':'pointer',color:'#fff',
+                  background:(grouping||ungrouped.length===0)?'#475569':'linear-gradient(135deg,#8b5cf6,#6366f1)'}}>
+                <Icon name={grouping?'hourglass_top':'auto_awesome'} size={18} color="#fff"/>
+                {grouping?'Analizando con IA...':`Agrupar ${ungrouped.length>0?ungrouped.length+' correo(s)':''} con IA`}
+              </button>
+            </div>
+            {groupMsg && (
+              <div style={{marginTop:10,padding:'8px 12px',borderRadius:8,fontSize:12,
+                background:groupMsg.ok?'rgba(34,197,94,0.12)':'rgba(239,68,68,0.12)',
+                color:groupMsg.ok?'#86efac':'#fca5a5'}}>{groupMsg.text}</div>
+            )}
           </div>
 
           {threads.length===0&&ungrouped.length===0?
@@ -821,6 +888,12 @@ function InboxView({ starred }){
                                   <span style={{fontSize:11,color:'#94a3b8'}}>{timeAgo(msg.created_at)}</span>
                                   <button onClick={e=>toggleStar(msg.id,e)} style={{background:'none',border:'none',cursor:'pointer',padding:2}}>
                                     <Icon name={msg.is_starred?'star':'star_outline'} size={18} color={msg.is_starred?'#f59e0b':'#cbd5e1'}/>
+                                  </button>
+                                  {/* Corregir una agrupación equivocada de la IA */}
+                                  <button title="Quitar de este expediente"
+                                    onClick={e=>{e.stopPropagation();assignProject(msg.id,null);}}
+                                    style={{background:'none',border:'none',cursor:'pointer',padding:2}}>
+                                    <Icon name="folder_off" size={17} color="#cbd5e1"/>
                                   </button>
                                 </div>
                               </div>
@@ -930,6 +1003,13 @@ function InboxView({ starred }){
                         </div>
                         <div style={{fontSize:14,fontWeight:email.is_read?400:600,color:'#1e293b',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{email.subject}</div>
                       </div>
+                      {/* Asignación manual a un expediente, sin salir de la lista */}
+                      <select value="" onClick={e=>e.stopPropagation()} onChange={e=>{e.stopPropagation();if(e.target.value)assignProject(email.id,Number(e.target.value));}}
+                        title="Mover a un expediente"
+                        style={{flexShrink:0,maxWidth:170,padding:'5px 8px',borderRadius:7,border:'1px solid #e2e8f0',background:'#f8fafc',color:'#64748b',fontSize:12,cursor:'pointer'}}>
+                        <option value="">Mover a expediente…</option>
+                        {projectList.map(p=><option key={p.id} value={p.id}>{p.title}</option>)}
+                      </select>
                       <span style={{fontSize:12,color:'#94a3b8',flexShrink:0}}>{timeAgo(email.created_at)}</span>
                     </div>
                   ))}
@@ -959,7 +1039,7 @@ function InboxView({ starred }){
                 {email.ai_priority==='urgente' && <span style={{...styles.tagTiny,background:'#dc2626'}}>URGENTE</span>}
               </div>
               <div style={{fontSize:14,fontWeight:email.is_read?400:600,color:'#1e293b',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{email.subject}</div>
-              <div style={{fontSize:12,color:'#94a3b8',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{email.ai_summary||email.body?.slice(0,100)}</div>
+              <div style={{fontSize:12,color:'#94a3b8',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{email.ai_summary||email.body_preview?.slice(0,100)}</div>
             </div>
             <div style={{display:'flex',flexDirection:'column',alignItems:'flex-end',gap:4,flexShrink:0}}>
               <span style={{fontSize:12,color:'#94a3b8'}}>{timeAgo(email.created_at)}</span>
@@ -3286,24 +3366,35 @@ function SettingsNoreplyTab(){
   const [testing,setTesting]=useState(false);
   const [testResult,setTestResult]=useState(null);
   const [testTo,setTestTo]=useState('');
+  const [loadError,setLoadError]=useState('');
+  const [saveError,setSaveError]=useState('');
 
   useEffect(()=>{
     (async()=>{
-      const res=await apiFetch('/admin/noreply-config');
-      if(res.success) setCfg(prev=>({...prev,...res.data,smtp_port:String(res.data.smtp_port||587),smtp_pass:''}));
-      setLoading(false);
+      try{
+        const res=await apiFetch('/admin/noreply-config');
+        if(res.success) setCfg(prev=>({...prev,...res.data,smtp_port:String(res.data.smtp_port||587),smtp_pass:''}));
+        else setLoadError(res.message||'No se pudo cargar la configuración del correo no-reply.');
+      }catch(err){
+        setLoadError(err?.message||'Error inesperado al cargar la configuración.');
+      }finally{
+        setLoading(false); // pase lo que pase, la pantalla no se queda colgada
+      }
     })();
   },[]);
 
-  function upd(k,v){setCfg(p=>({...p,[k]:v}));setSaved(false);}
+  function upd(k,v){setCfg(p=>({...p,[k]:v}));setSaved(false);setSaveError('');}
 
   async function save(e){
     e.preventDefault();
+    setSaveError('');
     const res=await apiFetch('/admin/noreply-config',{method:'PUT',body:JSON.stringify(cfg)});
     if(res.success){
       setSaved(true);
       setCfg(p=>({...p,has_password:p.has_password||!!p.smtp_pass,smtp_pass:''}));
       setTimeout(()=>setSaved(false),3000);
+    } else {
+      setSaveError(res.message||'No se pudo guardar la configuración.');
     }
   }
 
@@ -3332,6 +3423,13 @@ function SettingsNoreplyTab(){
             <span style={{...styles.tagSmall,background:cfg.enabled?'#22c55e':'#64748b'}}>{cfg.enabled?'ACTIVO':'INACTIVO'}</span>
           </div>
         </div>
+
+        {loadError && (
+          <div style={{marginBottom:16,padding:'12px 16px',borderRadius:10,background:'rgba(239,68,68,0.1)',border:'1px solid rgba(239,68,68,0.3)',display:'flex',alignItems:'center',gap:10}}>
+            <Icon name="error" size={22} color="#ef4444"/>
+            <span style={{fontSize:13,color:'#fca5a5'}}>{loadError}</span>
+          </div>
+        )}
 
         <form onSubmit={save}>
           <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:16}}>
@@ -3389,6 +3487,13 @@ function SettingsNoreplyTab(){
             </button>
           </div>
         </form>
+
+        {saveError && (
+          <div style={{marginTop:16,padding:'12px 16px',borderRadius:10,background:'rgba(239,68,68,0.1)',border:'1px solid rgba(239,68,68,0.3)',display:'flex',alignItems:'center',gap:10}}>
+            <Icon name="error" size={22} color="#ef4444"/>
+            <span style={{fontSize:13,color:'#fca5a5'}}>{saveError}</span>
+          </div>
+        )}
 
         {testResult && (
           <div style={{marginTop:16,padding:'12px 16px',borderRadius:10,background:testResult.ok?'rgba(34,197,94,0.1)':'rgba(239,68,68,0.1)',border:`1px solid ${testResult.ok?'rgba(34,197,94,0.3)':'rgba(239,68,68,0.3)'}`,display:'flex',alignItems:'center',gap:10}}>

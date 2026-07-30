@@ -26,7 +26,12 @@ export async function isGeminiActive() {
  * Llamada base a generateContent. Con jsonSchema fuerza salida JSON validable.
  * Lanza Error con mensaje legible si la API falla.
  */
-async function requestGemini({ apiKey, model, temperature, maxTokens }, contents, { jsonSchema = null, systemInstruction = null } = {}) {
+/* Espera por defecto de una llamada. Las tareas de razonamiento largo (agrupar
+   correspondencia, analizar una cadena con adjuntos) suben este valor: con los
+   modelos "pro" una sola respuesta puede tardar más de un minuto. */
+const DEFAULT_TIMEOUT_MS = 30000;
+
+async function requestGemini({ apiKey, model, temperature, maxTokens }, contents, { jsonSchema = null, systemInstruction = null, timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
   const body = {
     contents,
     generationConfig: {
@@ -38,7 +43,7 @@ async function requestGemini({ apiKey, model, temperature, maxTokens }, contents
   if (systemInstruction) body.systemInstruction = { parts: [{ text: systemInstruction }] };
 
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 30000);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   let res;
   try {
     res = await fetch(`${GEMINI_BASE}/models/${encodeURIComponent(model)}:generateContent`, {
@@ -48,7 +53,9 @@ async function requestGemini({ apiKey, model, temperature, maxTokens }, contents
       signal: controller.signal,
     });
   } catch (err) {
-    throw new Error(err.name === 'AbortError' ? 'Tiempo de espera agotado conectando con Gemini (30s)' : `No se pudo conectar con la API de Gemini: ${err.cause?.message || err.message}`);
+    throw new Error(err.name === 'AbortError'
+      ? `Tiempo de espera agotado conectando con Gemini (${Math.round(timeoutMs / 1000)}s)`
+      : `No se pudo conectar con la API de Gemini: ${err.cause?.message || err.message}`);
   } finally {
     clearTimeout(timer);
   }
@@ -58,13 +65,19 @@ async function requestGemini({ apiKey, model, temperature, maxTokens }, contents
     const msg = data.error?.message || `HTTP ${res.status}`;
     throw new Error(`Gemini API: ${msg}`);
   }
+  const finishReason = data.candidates?.[0]?.finishReason || '';
   const text = data.candidates?.[0]?.content?.parts?.map(p => p.text).join('') || '';
-  if (!text) throw new Error(`Gemini no devolvió contenido (finishReason: ${data.candidates?.[0]?.finishReason || 'desconocido'})`);
+  if (!text) throw new Error(`Gemini no devolvió contenido (finishReason: ${finishReason || 'desconocido'})`);
+  /* Con salida JSON forzada, agotar el presupuesto de tokens deja el JSON a medias
+     y el JSON.parse del llamador falla con un error incomprensible. Se detecta aquí. */
+  if (jsonSchema && finishReason === 'MAX_TOKENS') {
+    throw new Error('La respuesta de Gemini se truncó por el límite de tokens de salida. Reduzca el tamaño del lote o aumente "Máx. tokens" en Configuración → Gemini Pro API.');
+  }
   return text;
 }
 
-async function generateContent(cfg, prompt, { jsonSchema = null, systemInstruction = null, extraParts = [] } = {}) {
-  return requestGemini(cfg, [{ role: 'user', parts: [{ text: prompt }, ...extraParts] }], { jsonSchema, systemInstruction });
+async function generateContent(cfg, prompt, { jsonSchema = null, systemInstruction = null, extraParts = [], timeoutMs } = {}) {
+  return requestGemini(cfg, [{ role: 'user', parts: [{ text: prompt }, ...extraParts] }], { jsonSchema, systemInstruction, timeoutMs });
 }
 
 /** Chat multi-turno con el contexto de un proyecto. history: [{role:'user'|'assistant', text}] */
@@ -192,7 +205,8 @@ ASUNTO: ${subject}
 
 CONTENIDO:
 ${String(body || '').slice(0, 6000)}`;
-  const text = await generateContent({ ...cfg, temperature: 0.2, maxTokens: Math.max(cfg.maxTokens, 2048) }, prompt, { jsonSchema: schema, extraParts: parts });
+  const text = await generateContent({ ...cfg, temperature: 0.2, maxTokens: Math.max(cfg.maxTokens, 2048) }, prompt,
+    { jsonSchema: schema, extraParts: parts, timeoutMs: parts.length ? 120000 : 60000 }); // analizar adjuntos tarda más
   const parsed = JSON.parse(text);
   return {
     category: parsed.category || '',
@@ -253,8 +267,98 @@ ${names.length ? `- documents_findings: hallazgos concretos extraídos de los do
 
 CADENA (${messages.length} mensajes, orden cronológico):
 ${corpus.slice(0, 14000)}`;
-  const text = await generateContent({ ...cfg, temperature: 0.3, maxTokens: Math.max(cfg.maxTokens, 3072) }, prompt, { jsonSchema: schema, extraParts: parts });
+  const text = await generateContent({ ...cfg, temperature: 0.3, maxTokens: Math.max(cfg.maxTokens, 3072) }, prompt,
+    { jsonSchema: schema, extraParts: parts, timeoutMs: 180000 }); // la cadena puede llevar PDFs adjuntos
   return JSON.parse(text);
+}
+
+/**
+ * Agrupa correspondencia suelta en EXPEDIENTES/PROYECTOS de compra pública.
+ *
+ * Recibe los correos ya importados y clasificados (asunto, resumen IA, remitente,
+ * fecha) junto con los proyectos que YA existen, y devuelve los grupos que la
+ * evidencia respalda: cada grupo es un proyecto (existente o nuevo) con los
+ * correos que le pertenecen. Los mensajes que no corresponden a ninguna
+ * adquisición (notificaciones automáticas, boletines, spam) quedan fuera.
+ *
+ * items: [{id, subject, ai_summary, ai_category, ai_priority, from, date}]
+ * existingProjects: [{id, title, status}]
+ */
+export async function groupCorrespondencesIntoProjects(items, existingProjects = []) {
+  const cfg = await getGeminiSettings();
+  if (!cfg.enabled || !cfg.apiKey) return null;
+  const schema = {
+    type: 'OBJECT',
+    properties: {
+      groups: {
+        type: 'ARRAY',
+        items: {
+          type: 'OBJECT',
+          properties: {
+            project_id: { type: 'INTEGER' }, // id de un proyecto existente, o 0 si es nuevo
+            title: { type: 'STRING' },
+            description: { type: 'STRING' },
+            priority: { type: 'STRING', enum: ['baja', 'media', 'alta', 'urgente'] },
+            suggested_status: { type: 'STRING', enum: ['borrador', 'en_revision', 'aprobado', 'en_proceso', 'adjudicado', 'completado', 'cancelado'] },
+            estimated_amount: { type: 'NUMBER' },
+            rationale: { type: 'STRING' },
+            correspondence_ids: { type: 'ARRAY', items: { type: 'INTEGER' } },
+          },
+          required: ['project_id', 'title', 'description', 'priority', 'suggested_status', 'rationale', 'correspondence_ids'],
+        },
+      },
+      unassigned_ids: { type: 'ARRAY', items: { type: 'INTEGER' } },
+    },
+    required: ['groups', 'unassigned_ids'],
+  };
+
+  const projectList = existingProjects.length
+    ? existingProjects.map(p => `  - id ${p.id}: "${p.title}" (estado: ${p.status || 'borrador'})`).join('\n')
+    : '  (todavía no hay proyectos registrados)';
+
+  const corpus = items.map(i =>
+    `- id ${i.id} | ${String(i.date || '').slice(0, 10)} | DE: ${String(i.from || 'desconocido').slice(0, 80)} | CAT: ${i.ai_category || '—'} | ASUNTO: ${String(i.subject || '').slice(0, 200)}${i.ai_summary ? `\n    RESUMEN: ${String(i.ai_summary).slice(0, 240)}` : ''}`
+  ).join('\n');
+
+  const prompt = `Eres el analista documental de la Unidad de Adquisiciones y Contrataciones Públicas (UACP) de la Procuraduría General de la República de El Salvador, bajo la Ley de Compras Públicas (LCP, DL 652/2023; ente rector DINAC, sistema COMPRASAL).
+
+TAREA: organizar la correspondencia de abajo en EXPEDIENTES de compra pública. Un expediente (proyecto) agrupa todos los correos referidos a UNA MISMA adquisición o proceso: la solicitud, cotizaciones, aprobaciones, evaluación de ofertas, adjudicación, orden de compra, contrato y su seguimiento.
+
+REGLAS:
+1. Agrupa por el PROCESO DE ADQUISICIÓN al que se refiere el correo, no por remitente ni por fecha. Correos con asuntos distintos ("Solicitud de cotización sillas ergonómicas", "RE: cotización mobiliario", "Adjudicación mobiliario UACP") pertenecen al MISMO expediente si tratan de la misma compra.
+2. Si el correo corresponde a uno de los PROYECTOS YA EXISTENTES, usa su id en project_id. Si abre un expediente nuevo, usa project_id = 0 y propón un título claro y específico (máx 90 caracteres, ej. "Adquisición de mobiliario de oficina para la UACP").
+3. NO fuerces agrupaciones: un correo que no trate de una adquisición concreta (notificaciones automáticas, boletines, publicidad, correos personales, avisos de sistema, spam) va en unassigned_ids. Es preferible dejarlo sin asignar que inventar un expediente.
+4. Un expediente nuevo debe tener al menos 1 correo con contenido real de compra pública. No crees expedientes genéricos tipo "Correos varios" o "Notificaciones".
+5. Cada id de correo puede aparecer UNA SOLA VEZ, en un único grupo o en unassigned_ids.
+6. Usa SOLO los id que aparecen en la lista. No inventes id.
+7. description: 1 o 2 oraciones en español sobre el objeto de la adquisición.
+8. suggested_status: la fase que la evidencia de los correos respalda (borrador → en_revision → aprobado → en_proceso → adjudicado → completado).
+9. estimated_amount: monto en dólares si aparece en los correos; 0 si no consta. No lo inventes.
+10. rationale: en una oración, la evidencia concreta que sustenta el grupo.
+
+PROYECTOS YA EXISTENTES:
+${projectList}
+
+CORRESPONDENCIA A ORGANIZAR (${items.length} correos):
+${corpus.slice(0, 30000)}`;
+
+  /* El JSON de salida crece con el número de grupos (un objeto por expediente más
+     la lista de ids): 8192 tokens se agotaban a mitad de la respuesta. */
+  const text = await generateContent(
+    { ...cfg, temperature: 0.2, maxTokens: Math.max(cfg.maxTokens, 32768) },
+    prompt,
+    { jsonSchema: schema, timeoutMs: 240000 } // razonamiento largo sobre decenas de correos
+  );
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    throw new Error('Gemini devolvió una respuesta JSON incompleta al agrupar la correspondencia. Reintente con un lote menor.');
+  }
+  return {
+    groups: Array.isArray(parsed.groups) ? parsed.groups : [],
+    unassigned_ids: Array.isArray(parsed.unassigned_ids) ? parsed.unassigned_ids : [],
+  };
 }
 
 /** Asistente LCP: explica el método de contratación aplicable a un monto (Ley de Compras Públicas, DL 652/2023). */

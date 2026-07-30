@@ -25,7 +25,7 @@ function explainTlsError(message) {
 }
 
 function imapClient(cfg) {
-  return new ImapFlow({
+  const client = new ImapFlow({
     host: cfg.imap_host,
     port: Number(cfg.imap_port) || 993,
     secure: !!cfg.imap_secure,
@@ -35,6 +35,15 @@ function imapClient(cfg) {
     greetingTimeout: 15000,
     tls: tlsOptions,
   });
+  /* Imprescindible: ImapFlow es un EventEmitter y un corte de la conexión TLS
+     (ECONNRESET típico tras un rato inactivo) emite 'error' FUERA del await. Sin
+     este listener Node lo trata como excepción no capturada y tumba el proceso
+     entero — incluido el servidor web. El try/catch de syncInbox no alcanza a
+     verlo porque no ocurre dentro de la promesa que se está esperando.
+     Aquí solo se registra: la operación en curso falla por su propia vía. */
+  client.on('error', err =>
+    console.error(`[email-sync] Conexión IMAP de ${cfg.email_address} interrumpida: ${err.message}`));
+  return client;
 }
 
 function smtpTransport(cfg) {
@@ -90,9 +99,43 @@ export async function testEmailConnection(cfg) {
   return result;
 }
 
+/* Topes de un ciclo de sincronización. La descarga IMAP y el análisis con IA se
+   hacen en FASES SEPARADAS (ver syncInbox), así que estos límites acotan cuánto
+   se sostiene en memoria por ciclo; lo que sobra queda "pendiente" y entra en el
+   siguiente ciclo del programador automático. */
+const MAX_MESSAGES_PER_RUN = 150;
+const MAX_DOWNLOAD_BYTES = 150 * 1024 * 1024;
+/* Clasificaciones IA simultáneas. Secuencial, 150 correos × ~3 s tardaba más de
+   lo que cualquier servidor IMAP mantiene viva una sesión. */
+const AI_CONCURRENCY = 4;
+
+/** Ejecuta `fn` sobre `items` con como máximo `n` en vuelo, conservando el orden del resultado. */
+async function mapWithConcurrency(items, n, fn) {
+  const out = new Array(items.length);
+  let next = 0;
+  const workers = Array.from({ length: Math.min(n, items.length) }, async () => {
+    while (next < items.length) {
+      const i = next++;
+      out[i] = await fn(items[i], i);
+    }
+  });
+  await Promise.all(workers);
+  return out;
+}
+
 /**
- * Sincroniza el buzón IMAP del usuario: importa los últimos mensajes de INBOX
- * como correspondencias (con clasificación Gemini si está activa).
+ * Sincroniza el buzón IMAP del usuario: importa los mensajes de INBOX como
+ * correspondencias (con clasificación Gemini si está activa).
+ *
+ * Va en DOS FASES a propósito:
+ *   Fase 1 — descarga IMAP pura (sin ninguna llamada externa de por medio) y
+ *            cierre inmediato de la sesión.
+ *   Fase 2 — parseo, clasificación con IA e inserción, ya con la conexión IMAP
+ *            cerrada.
+ * Antes la llamada a Gemini se hacía DENTRO del `for await` sobre el stream
+ * IMAP abierto: el servidor de correo veía una sesión que tardaba minutos en
+ * consumir el fetch y la cortaba ("Connection not available"), tumbando el ciclo
+ * completo sin importar nada.
  */
 export async function syncInbox(userId, { limit = 0 } = {}) {
   const cfg = await get('SELECT * FROM user_email_config WHERE user_id=? AND is_active=1', [userId]);
@@ -100,10 +143,14 @@ export async function syncInbox(userId, { limit = 0 } = {}) {
   if (!cfg.imap_host) throw new Error('Servidor IMAP no configurado.');
 
   const client = imapClient(cfg);
-  let imported = 0, skipped = 0, classified = 0;
-  // limit <= 0  → SIN LÍMITE: importa TODOS los correos históricos pendientes del buzón.
+  let imported = 0, skipped = 0, classified = 0, total = 0, pending = 0;
+  // limit <= 0 → sin límite pedido por quien llama; aun así se respeta el tope
+  // por ciclo (MAX_MESSAGES_PER_RUN) y el resto queda en cola.
   const unlimited = !Number.isFinite(limit) || limit <= 0;
+  const perRun = unlimited ? MAX_MESSAGES_PER_RUN : Math.min(limit, MAX_MESSAGES_PER_RUN);
 
+  /* ── Fase 1: descarga (solo IMAP, sin llamadas a la IA) ── */
+  const downloaded = [];
   await client.connect();
   try {
     // SOLO LECTURA: el buzón se abre con EXAMINE (readOnly), de modo que la
@@ -111,7 +158,7 @@ export async function syncInbox(userId, { limit = 0 } = {}) {
     // altera ningún estado del correo en el servidor.
     const lock = await client.getMailboxLock('INBOX', { readOnly: true });
     try {
-      const total = client.mailbox.exists;
+      total = client.mailbox.exists;
       if (total === 0) return { imported, skipped, classified, total, pending: 0 };
 
       // 1) UID ya importados de este buzón (dedupe en memoria, una sola consulta).
@@ -126,56 +173,84 @@ export async function syncInbox(userId, { limit = 0 } = {}) {
       // 3) Pendientes = los que aún no están en la base.
       const pendingUids = allUids.filter(uid => !existing.has(`${cfg.email_address}:${uid}`));
       skipped = allUids.length - pendingUids.length;
-      const toImport = unlimited ? pendingUids : pendingUids.slice(0, limit);
+      const toDownload = pendingUids.slice(0, perRun);
 
-      // 4) Descargar e importar SOLO los pendientes, en lotes para no saturar memoria.
-      const CHUNK = 200;
-      for (let i = 0; i < toImport.length; i += CHUNK) {
-        const range = toImport.slice(i, i + CHUNK).join(',');
+      // 4) Bajar el lote a memoria lo más rápido posible; el tope de bytes evita
+      //    que un buzón con adjuntos pesados agote la RAM del servidor.
+      let bytes = 0;
+      const CHUNK = 50;
+      outer:
+      for (let i = 0; i < toDownload.length; i += CHUNK) {
+        const range = toDownload.slice(i, i + CHUNK).join(',');
         for await (const msg of client.fetch(range, { uid: true, source: true }, { uid: true })) {
           if (!msg.source) continue;
-          const uidKey = `${cfg.email_address}:${msg.uid}`;
-          const parsed = await simpleParser(msg.source);
-          const subject = (parsed.subject || '(sin asunto)').slice(0, 290);
-          const body = (parsed.text || parsed.html?.replace(/<[^>]+>/g, ' ') || '').slice(0, 100000);
-          const fromText = (parsed.from?.text || 'Remitente desconocido').slice(0, 290);
-          const attachments = (parsed.attachments || []).filter(a => a.content?.length);
-
-          /* Clasificación con Gemini incluyendo el contenido de los adjuntos (PDF/imágenes) */
-          let ai = null;
-          try {
-            ai = await classifyCorrespondence(subject, body,
-              attachments.map(a => ({ buffer: a.content, contentType: a.contentType, filename: a.filename || 'adjunto' })));
-            if (ai) classified++;
-          } catch (err) {
-            console.error('[email-sync] Clasificación Gemini falló:', err.message);
-          }
-
-          const r = await run(`INSERT INTO correspondences(subject,body,from_user_id,to_user_id,label,external_from,imap_uid,ai_category,ai_priority,ai_summary,created_at)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
-            [subject, body, null, userId, 'inbox', encryptField(fromText), uidKey,
-             ai?.category || '', ai?.priority || '', ai?.summary || '',
-             parsed.date ? parsed.date.toISOString().slice(0, 19).replace('T', ' ') : null]);
-
-          /* Guardar adjuntos en disco y registrarlos */
-          for (const a of attachments) {
-            const safeName = sanitizeFilename(a.filename);
-            const storedPath = path.join(ATTACHMENTS_DIR, `${r.lastID}_${Date.now()}_${safeName}`);
-            fs.writeFileSync(storedPath, a.content);
-            await run('INSERT INTO correspondence_attachments(correspondence_id,filename,content_type,size_bytes,stored_path) VALUES(?,?,?,?,?)',
-              [r.lastID, safeName, (a.contentType || 'application/octet-stream').slice(0, 140), a.content.length, storedPath]);
-          }
-          imported++;
+          downloaded.push({ uid: msg.uid, source: msg.source });
+          bytes += msg.source.length;
+          if (bytes >= MAX_DOWNLOAD_BYTES) break outer;
         }
       }
-      await run('UPDATE user_email_config SET last_sync=SYSDATETIME() WHERE user_id=?', [userId]);
-      return { imported, skipped, classified, total, pending: pendingUids.length - toImport.length };
+      pending = pendingUids.length - downloaded.length;
     } finally {
       lock.release();
     }
   } finally {
+    // Se cierra ANTES de analizar: la IA nunca retiene la sesión IMAP.
     try { await client.logout(); } catch { /* conexión ya cerrada */ }
   }
+
+  /* ── Fase 2: parseo + clasificación IA + inserción (sin conexión IMAP) ── */
+  const SUB_BATCH = 8; // acota cuántos mensajes parseados coexisten en memoria
+  for (let i = 0; i < downloaded.length; i += SUB_BATCH) {
+    const slice = downloaded.slice(i, i + SUB_BATCH);
+
+    const prepared = await mapWithConcurrency(slice, AI_CONCURRENCY, async item => {
+      const parsed = await simpleParser(item.source);
+      const subject = (parsed.subject || '(sin asunto)').slice(0, 290);
+      // mailparser: parsed.html es `false` (no null) cuando no hay HTML, por eso
+      // ?. no lo corta; hay que comprobar que sea string antes de usar .replace().
+      const htmlText = typeof parsed.html === 'string' ? parsed.html.replace(/<[^>]+>/g, ' ') : '';
+      const body = (parsed.text || htmlText || '').slice(0, 100000);
+      const fromText = (parsed.from?.text || 'Remitente desconocido').slice(0, 290);
+      const attachments = (parsed.attachments || []).filter(a => a.content?.length);
+
+      /* Clasificación con Gemini incluyendo el contenido de los adjuntos (PDF/imágenes).
+         Si la IA falla, el correo se importa igual sin clasificar. */
+      let ai = null;
+      try {
+        ai = await classifyCorrespondence(subject, body,
+          attachments.map(a => ({ buffer: a.content, contentType: a.contentType, filename: a.filename || 'adjunto' })));
+      } catch (err) {
+        console.error('[email-sync] Clasificación Gemini falló:', err.message);
+      }
+      return { uid: item.uid, subject, body, fromText, attachments, ai, date: parsed.date };
+    });
+
+    // Las inserciones van en serie y en orden cronológico (UID ascendente).
+    for (const p of prepared) {
+      if (p.ai) classified++;
+      const r = await run(`INSERT INTO correspondences(subject,body,from_user_id,to_user_id,label,external_from,imap_uid,ai_category,ai_priority,ai_summary,created_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
+        [p.subject, p.body, null, userId, 'inbox', encryptField(p.fromText), `${cfg.email_address}:${p.uid}`,
+         p.ai?.category || '', p.ai?.priority || '', p.ai?.summary || '',
+         p.date ? p.date.toISOString().slice(0, 19).replace('T', ' ') : null]);
+
+      /* Guardar adjuntos en disco y registrarlos */
+      for (const a of p.attachments) {
+        const safeName = sanitizeFilename(a.filename);
+        const storedPath = path.join(ATTACHMENTS_DIR, `${r.lastID}_${Date.now()}_${safeName}`);
+        fs.writeFileSync(storedPath, a.content);
+        await run('INSERT INTO correspondence_attachments(correspondence_id,filename,content_type,size_bytes,stored_path) VALUES(?,?,?,?,?)',
+          [r.lastID, safeName, (a.contentType || 'application/octet-stream').slice(0, 140), a.content.length, storedPath]);
+      }
+      imported++;
+    }
+
+    // Liberar los buffers ya procesados de este sub-lote.
+    for (let k = i; k < i + slice.length; k++) downloaded[k] = null;
+  }
+
+  await run('UPDATE user_email_config SET last_sync=SYSDATETIME() WHERE user_id=?', [userId]);
+  return { imported, skipped, classified, total, pending };
 }
 
 /** Estado del buzón de un usuario: total en el servidor, ya importados y

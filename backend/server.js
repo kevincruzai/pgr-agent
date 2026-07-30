@@ -16,8 +16,20 @@ async function start() {
     const app = createApp();
 
     // Backend / API en su puerto dedicado.
-    app.listen(config.port, () =>
+    const api = app.listen(config.port, () =>
       console.log(`⚖️  PGR Compras Públicas — backend/API → http://localhost:${config.port}`));
+    // Sin este manejador, un proceso anterior que siga ocupando el puerto provoca
+    // un 'error' no capturado: el arranque falla de forma confusa y el proceso
+    // VIEJO sigue atendiendo la API con código desactualizado (rutas que faltan → 404).
+    api.on('error', err => {
+      if (err.code === 'EADDRINUSE') {
+        console.error(`FATAL: el puerto ${config.port} ya está en uso: hay otra instancia del backend ` +
+          `corriendo (posiblemente con código anterior). Ciérrela y vuelva a iniciar.`);
+      } else {
+        console.error(`FATAL: no se pudo escuchar en el puerto ${config.port}: ${err.message}`);
+      }
+      process.exit(1);
+    });
 
     // Frontend (PWA) en el puerto HTTP estándar (80), servido por el MISMO
     // proceso. Como el frontend llama a la API con rutas relativas (/api), así
