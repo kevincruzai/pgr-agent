@@ -96,60 +96,109 @@ test('auth: omitir onboarding lo marca completado de forma persistente', async (
 });
 
 /* ─── 2b. Gestión de usuarios: clave temporal obligatoria y perfil ─── */
-test('usuarios: el admin crea la cuenta con clave temporal, cargo y teléfono', async () => {
+/* Clave temporal que el SERVIDOR generó al crear TEST_DOC2. El admin nunca la
+   elige; solo la ve aquí porque la cuenta se crea sin correo de contacto. */
+let tempPass2;
+
+test('usuarios: el admin crea la cuenta y el sistema genera la clave temporal', async () => {
   const r = await api('POST', '/admin/users', { token: adminToken, body: {
-    name: `${MARK} Personal UCP`, document_number: TEST_DOC2, password: 'Temporal99!',
-    email: 'personal@audit.local', phone: '2231-9499', position: 'Analista de Compras', role: 'analista', unit_id: 6,
+    name: `${MARK} Personal UCP`, document_number: TEST_DOC2,
+    phone: '2231-9499', position: 'Analista de Compras', role: 'analista', unit_id: 6,
   } });
   assert.equal(r.status, 200);
   assert.equal(r.json.must_change_password, true);
+  // Sin correo al cual enviarla, la clave se entrega una vez por pantalla.
+  assert.ok(r.json.temp_password && r.json.temp_password.length >= 8, 'el servidor debe devolver la clave generada');
+  tempPass2 = r.json.temp_password;
   const row = await get('SELECT phone, position, must_change_password FROM users WHERE document_number=?', [TEST_DOC2]);
   assert.equal(row.position, 'Analista de Compras');
   assert.equal(row.phone, '2231-9499');
   assert.equal(row.must_change_password, true);
 });
 
-test('usuarios: la clave temporal corta se rechaza (mínimo 8)', async () => {
-  const r = await api('POST', '/admin/users', { token: adminToken, body: { name: 'X', document_number: '99000000-3', password: 'corta1' } });
+test('seguridad: el admin no puede elegir la contraseña al crear una cuenta', async () => {
+  const r = await api('POST', '/admin/users', { token: adminToken, body: {
+    name: 'X', document_number: '99000000-3', password: 'LaQueYoQuiera9!',
+  } });
   assert.equal(r.status, 400);
+  assert.equal(await get('SELECT id FROM users WHERE document_number=?', ['99000000-3']), undefined);
 });
 
 test('usuarios: al ingresar con clave temporal el sistema exige el cambio', async () => {
-  const l = await login(TEST_DOC2, 'Temporal99!');
+  const l = await login(TEST_DOC2, tempPass2);
   assert.equal(l.user.must_change_password, true, 'el login debe indicar el cambio obligatorio');
 });
 
 test('usuarios: el cambio de clave valida fortaleza y la clave actual', async () => {
-  const t = (await login(TEST_DOC2, 'Temporal99!')).token;
+  const t = (await login(TEST_DOC2, tempPass2)).token;
   // débil → 400
-  let r = await api('POST', '/auth/change-password', { token: t, body: { current_password: 'Temporal99!', new_password: 'soloLetras' } });
+  let r = await api('POST', '/auth/change-password', { token: t, body: { current_password: tempPass2, new_password: 'soloLetras' } });
   assert.equal(r.status, 400);
   // clave actual incorrecta → 401
   r = await api('POST', '/auth/change-password', { token: t, body: { current_password: 'incorrecta', new_password: 'MiClaveNueva26' } });
   assert.equal(r.status, 401);
   // correcta → limpia la bandera y la nueva clave funciona
-  r = await api('POST', '/auth/change-password', { token: t, body: { current_password: 'Temporal99!', new_password: 'MiClaveNueva26' } });
+  r = await api('POST', '/auth/change-password', { token: t, body: { current_password: tempPass2, new_password: 'MiClaveNueva26' } });
   assert.equal(r.status, 200);
   const l = await login(TEST_DOC2, 'MiClaveNueva26');
   assert.equal(l.user.must_change_password, false);
   // la clave temporal vieja ya no sirve
-  assert.equal((await api('POST', '/auth/login', { body: { document_number: TEST_DOC2, password: 'Temporal99!' } })).status, 401);
+  assert.equal((await api('POST', '/auth/login', { body: { document_number: TEST_DOC2, password: tempPass2 } })).status, 401);
 });
 
-test('usuarios: el reseteo de clave por el admin reactiva el cambio obligatorio', async () => {
+/* El admin administra proyectos, no credenciales: si pudiera fijar la clave de
+   otro usuario podría entrar como él y leer su correo interno ya descifrado. */
+test('seguridad: el formulario de edición no puede cambiar la contraseña', async () => {
   const u = await get('SELECT id FROM users WHERE document_number=?', [TEST_DOC2]);
-  const r = await api('PUT', `/admin/users/${u.id}`, { token: adminToken, body: { name: `${MARK} Personal UCP`, role: 'analista', password: 'OtraTemporal7!' } });
+  const r = await api('PUT', `/admin/users/${u.id}`, { token: adminToken, body: {
+    name: `${MARK} Personal UCP`, role: 'analista', password: 'OtraTemporal7!',
+  } });
+  assert.equal(r.status, 400);
+  // La clave del usuario quedó intacta y la impuesta por el admin no sirve.
+  assert.equal((await api('POST', '/auth/login', { body: { document_number: TEST_DOC2, password: 'OtraTemporal7!' } })).status, 401);
+  assert.equal((await login(TEST_DOC2, 'MiClaveNueva26')).user.must_change_password, false);
+});
+
+test('seguridad: el jefe UACP no puede restablecer contraseñas (solo el admin general)', async () => {
+  const u = await get('SELECT id FROM users WHERE document_number=?', [TEST_DOC2]);
+  const r = await api('POST', `/admin/users/${u.id}/regenerate-password`, { token: jefeToken });
+  assert.equal(r.status, 403);
+  assert.equal((await login(TEST_DOC2, 'MiClaveNueva26')).user.must_change_password, false, 'la clave no debe haber cambiado');
+});
+
+test('seguridad: el reseteo de un usuario sin correo sí entrega la clave (no hay buzón que proteger)', async () => {
+  const u = await get('SELECT id FROM users WHERE document_number=?', [TEST_DOC2]);
+  const r = await api('POST', `/admin/users/${u.id}/regenerate-password`, { token: adminToken });
   assert.equal(r.status, 200);
-  assert.equal((await login(TEST_DOC2, 'OtraTemporal7!')).user.must_change_password, true);
+  assert.equal(r.json.emailed, false);
+  assert.ok(r.json.temp_password, 'sin correo ni buzón, la entrega manual es el único canal');
+  assert.equal((await login(TEST_DOC2, r.json.temp_password)).user.must_change_password, true);
+  tempPass2 = r.json.temp_password;
 });
 
 test('usuarios: cada quien actualiza sus datos de contacto (perfil propio)', async () => {
-  const t = (await login(TEST_DOC2, 'OtraTemporal7!')).token;
+  const t = (await login(TEST_DOC2, tempPass2)).token;
   const r = await api('PUT', '/auth/profile', { token: t, body: { email: 'nuevo@audit.local', phone: '7777-8888' } });
   assert.equal(r.status, 200);
   const me = await api('GET', '/auth/me', { token: t });
   assert.equal(me.json.user.email, 'nuevo@audit.local');
   assert.equal(me.json.user.phone, '7777-8888');
+});
+
+/* Garantía central: con correo registrado, la clave nueva viaja SOLO al titular.
+   Si el envío falla el reseteo se aborta y la clave anterior sigue vigente, para
+   que un fallo de SMTP no deje al usuario bloqueado con una clave que nadie sabe. */
+test('seguridad: al restablecer, la clave nunca vuelve al panel del admin', async () => {
+  const u = await get('SELECT id FROM users WHERE document_number=?', [TEST_DOC2]);
+  const r = await api('POST', `/admin/users/${u.id}/regenerate-password`, { token: adminToken });
+  assert.equal(r.json.temp_password, undefined, 'la clave jamás debe devolverse cuando hay correo del titular');
+  if (r.status === 200) {
+    assert.equal(r.json.emailed, true);
+  } else {
+    // Sin SMTP configurado: se aborta y la clave vigente no se toca.
+    assert.equal(r.status, 502);
+    assert.equal((await login(TEST_DOC2, tempPass2)).user.must_change_password, true);
+  }
 });
 
 /* ─── 3. Autorización por rol ─── */
@@ -169,15 +218,13 @@ test('authz: jefe UACP administra usuarios pero NO la configuración Gemini/sett
   assert.equal((await api('POST', '/admin/impersonate/3', { token: jefeToken })).status, 403);
 });
 
-test('authz: impersonación del admin general emite token funcional del usuario destino', async () => {
+/* La impersonación está desactivada por diseño: iniciar sesión como otro usuario
+   daría acceso a su correo interno ya descifrado, que es justo lo que protege el
+   cifrado en reposo. Mismo motivo por el que el admin no fija ni ve contraseñas. */
+test('authz: la impersonación está desactivada incluso para el admin general', async () => {
   const imp = await api('POST', '/admin/impersonate/4', { token: adminToken });
-  assert.equal(imp.status, 200);
-  const me = await api('GET', '/auth/me', { token: imp.json.token });
-  assert.equal(me.json.user.id, 4);
-});
-
-test('authz: el admin no puede impersonarse a sí mismo → 400', async () => {
-  assert.equal((await api('POST', '/admin/impersonate/1', { token: adminToken })).status, 400);
+  assert.equal(imp.status, 403);
+  assert.equal(imp.json.token, undefined, 'no debe emitirse ningún token de otro usuario');
 });
 
 /* ─── 4. Proyectos: ciclo de vida y seguimiento ─── */

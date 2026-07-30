@@ -2425,19 +2425,12 @@ function SettingsUsersTab({ userRole, currentUserId }){
   const [loading,setLoading]=useState(true);
   const [showForm,setShowForm]=useState(false);
   const [editing,setEditing]=useState(null);
-  const emptyUserForm={name:'',document_type:'DUI',document_number:'',email:'',phone:'',position:'',password:'',role:'solicitante',unit_id:''};
+  const emptyUserForm={name:'',document_type:'DUI',document_number:'',email:'',phone:'',position:'',role:'solicitante',unit_id:''};
   const [form,setForm]=useState(emptyUserForm);
   const [error,setError]=useState('');
-  const [createdInfo,setCreatedInfo]=useState(null); // {name, doc, tempPassword} mostrado al admin tras crear
-
-  function genTempPassword(){
-    // clave temporal legible: 3 sílabas + 3 dígitos + símbolo (≥8, letras y números)
-    const con='bcdfgmprstv', vow='aeiou';
-    let p='';
-    for(let i=0;i<3;i++) p+=con[Math.floor(Math.random()*con.length)]+vow[Math.floor(Math.random()*vow.length)];
-    p=p[0].toUpperCase()+p.slice(1)+Math.floor(100+Math.random()*900)+'!';
-    setForm(f=>({...f,password:p}));
-  }
+  // {name, doc, tempPassword?, emailed, emailMsg} — tempPassword solo llega cuando
+  // el servidor no pudo entregar la clave al titular por correo.
+  const [createdInfo,setCreatedInfo]=useState(null);
 
   const load=useCallback(async()=>{
     setLoading(true);
@@ -2457,7 +2450,7 @@ function SettingsUsersTab({ userRole, currentUserId }){
   }
   function openEdit(u){
     setEditing(u);
-    setForm({name:u.name,document_type:u.document_type,document_number:u.document_number,email:u.email||'',phone:u.phone||'',position:u.position||'',password:'',role:u.role,unit_id:u.unit_id||''});
+    setForm({name:u.name,document_type:u.document_type,document_number:u.document_number,email:u.email||'',phone:u.phone||'',position:u.position||'',role:u.role,unit_id:u.unit_id||''});
     setShowForm(true); setError(''); setCreatedInfo(null);
   }
 
@@ -2466,14 +2459,12 @@ function SettingsUsersTab({ userRole, currentUserId }){
     const body={...form,unit_id:form.unit_id?Number(form.unit_id):null};
     let res;
     if(editing){
-      if(!body.password) delete body.password;
-      else if(body.password.length<8) return setError('La nueva clave temporal debe tener al menos 8 caracteres');
+      // Este formulario ya no cambia contraseñas: el reseteo va por su propia acción.
       res=await apiFetch(`/admin/users/${editing.id}`,{method:'PUT',body:JSON.stringify(body)});
-      if(res.success&&body.password) setCreatedInfo({name:form.name,doc:form.document_number,tempPassword:body.password,reset:true});
     } else {
-      if(!body.password||body.password.length<8) return setError('La clave temporal debe tener al menos 8 caracteres (use "Generar")');
+      // La clave temporal la genera el servidor y se la envía al usuario.
       res=await apiFetch('/admin/users',{method:'POST',body:JSON.stringify(body)});
-      if(res.success) setCreatedInfo({name:form.name,doc:form.document_number,tempPassword:body.password,emailed:res.emailed,emailMsg:res.message});
+      if(res.success) setCreatedInfo({name:form.name,doc:form.document_number,tempPassword:res.temp_password,emailed:res.emailed,emailMsg:res.message});
     }
     if(res.success){setShowForm(false);load();}
     else setError(res.message||'Error');
@@ -2486,13 +2477,15 @@ function SettingsUsersTab({ userRole, currentUserId }){
   }
 
   async function regeneratePassword(u){
-    const dest=u.email?` y se enviará a ${u.email}`:' (el usuario no tiene correo: deberá entregarla manualmente)';
-    if(!window.confirm(`¿Regenerar la contraseña de ${u.name}? Se generará una nueva clave temporal${dest}.`)) return;
+    const dest=u.email
+      ? ` La nueva clave se enviará solo a ${u.email}; por seguridad no se mostrará aquí.`
+      : ' El usuario no tiene correo registrado: si tampoco tiene buzón configurado, deberá entregarla manualmente.';
+    if(!window.confirm(`¿Restablecer la contraseña de ${u.name}?${dest}`)) return;
     const res=await apiFetch(`/admin/users/${u.id}/regenerate-password`,{method:'POST'});
     if(res.success){
       setCreatedInfo({name:u.name,doc:u.document_number,tempPassword:res.temp_password,reset:true,emailed:res.emailed,emailMsg:res.message});
       load();
-    } else alert(res.message||'No se pudo regenerar la contraseña');
+    } else alert(res.message||'No se pudo restablecer la contraseña');
   }
 
   const ROLES=[{v:'admin',l:'Administrador'},{v:'jefe_uacp',l:'Jefe UACP'},{v:'analista',l:'Analista'},{v:'solicitante',l:'Solicitante'}];
@@ -2517,9 +2510,12 @@ function SettingsUsersTab({ userRole, currentUserId }){
                 {createdInfo.reset?'Clave temporal reseteada para':'Usuario creado:'} {createdInfo.name}
               </div>
               <div style={{fontSize:13,color:'#15803d',marginTop:4}}>
-                Documento: <strong>{createdInfo.doc}</strong> · Clave temporal:
-                <code style={{margin:'0 6px',padding:'3px 10px',borderRadius:6,background:'#dcfce7',fontWeight:700,fontSize:14}}>{createdInfo.tempPassword}</code>
-                <button onClick={()=>navigator.clipboard?.writeText(createdInfo.tempPassword)} style={{...styles.iconBtn,verticalAlign:'middle'}} title="Copiar clave"><Icon name="content_copy" size={16} color="#16a34a"/></button>
+                Documento: <strong>{createdInfo.doc}</strong>
+                {createdInfo.tempPassword&&<>
+                  {' · '}Clave temporal:
+                  <code style={{margin:'0 6px',padding:'3px 10px',borderRadius:6,background:'#dcfce7',fontWeight:700,fontSize:14}}>{createdInfo.tempPassword}</code>
+                  <button onClick={()=>navigator.clipboard?.writeText(createdInfo.tempPassword)} style={{...styles.iconBtn,verticalAlign:'middle'}} title="Copiar clave"><Icon name="content_copy" size={16} color="#16a34a"/></button>
+                </>}
               </div>
               {createdInfo.emailed!==undefined&&(
                 <div style={{fontSize:12,fontWeight:600,marginTop:6,display:'flex',alignItems:'center',gap:6,color:createdInfo.emailed?'#15803d':'#b45309'}}>
@@ -2528,7 +2524,9 @@ function SettingsUsersTab({ userRole, currentUserId }){
                 </div>
               )}
               <div style={{fontSize:12,color:'#15803d',marginTop:4}}>
-                ⚠ Cópiela y entréguela por un canal seguro — <strong>no volverá a mostrarse</strong>. El usuario deberá cambiarla en su primer inicio de sesión.
+                {createdInfo.tempPassword
+                  ? <>⚠ Cópiela y entréguela por un canal seguro — <strong>no volverá a mostrarse</strong>. El usuario deberá cambiarla en su primer inicio de sesión.</>
+                  : <>La clave llegó <strong>solo al buzón del titular</strong>; el panel no la conserva. El usuario deberá cambiarla en su primer inicio de sesión.</>}
               </div>
             </div>
             <button onClick={()=>setCreatedInfo(null)} style={styles.iconBtn}><Icon name="close" size={18} color="#16a34a"/></button>
@@ -2548,15 +2546,13 @@ function SettingsUsersTab({ userRole, currentUserId }){
               <div><label style={styles.label}>Teléfono</label><input style={styles.input} value={form.phone} onChange={e=>upd('phone',e.target.value)} placeholder="Ej.: 2231-9400"/></div>
               <div><label style={styles.label}>Tipo Doc.</label><select style={styles.select} value={form.document_type} onChange={e=>upd('document_type',e.target.value)}><option>DUI</option><option>Pasaporte</option></select></div>
               <div><label style={styles.label}>Nº Documento *</label><input style={styles.input} value={form.document_number} onChange={e=>upd('document_number',e.target.value)} disabled={!!editing} required/></div>
-              <div style={{gridColumn:'1/-1'}}>
-                <label style={styles.label}>Clave temporal {editing?'(dejar vacío para no resetear)':'*'}</label>
-                <div style={{display:'flex',gap:8}}>
-                  <input style={{...styles.input,flex:1,marginBottom:0,fontFamily:'Consolas,monospace'}} value={form.password} onChange={e=>upd('password',e.target.value)} placeholder={editing?'Sin cambios':'Mínimo 8 caracteres'}/>
-                  <button type="button" onClick={genTempPassword} style={{padding:'0 16px',borderRadius:10,border:'none',cursor:'pointer',fontSize:13,fontWeight:700,color:'#fff',background:'linear-gradient(135deg,#3b82f6,#8b5cf6)',whiteSpace:'nowrap'}}>
-                    <Icon name="casino" size={16} color="#fff" style={{marginRight:4}}/>Generar
-                  </button>
-                </div>
-                <span style={{fontSize:11,color:'#94a3b8'}}>El usuario estará <strong>obligado a cambiarla</strong> en su primer inicio de sesión. Compártala por un canal seguro.</span>
+              <div style={{gridColumn:'1/-1',display:'flex',alignItems:'flex-start',gap:8,padding:'10px 12px',borderRadius:10,background:'#f8fafc',border:'1px solid #e2e8f0'}}>
+                <Icon name="shield_lock" size={18} color="#64748b"/>
+                <span style={{fontSize:11,color:'#64748b',lineHeight:1.5}}>
+                  {editing
+                    ? <>Las contraseñas no se editan desde aquí. Use <strong>Restablecer contraseña</strong> en la lista: la clave se genera sola y llega únicamente al correo del titular.</>
+                    : <>La <strong>clave temporal la genera el sistema</strong> y se envía al correo del usuario, que estará obligado a cambiarla en su primer ingreso. Si no registra un correo, la clave se mostrará una sola vez para entregarla en mano.</>}
+                </span>
               </div>
               <div><label style={styles.label}>Rol</label><select style={styles.select} value={form.role} onChange={e=>upd('role',e.target.value)}>{ROLES.map(r=><option key={r.v} value={r.v}>{r.l}</option>)}</select></div>
               <div><label style={styles.label}>Unidad</label><select style={styles.select} value={form.unit_id} onChange={e=>upd('unit_id',e.target.value)}><option value="">Sin unidad</option>{units.map(u=><option key={u.id} value={u.id}>{u.name}</option>)}</select></div>
@@ -2594,7 +2590,8 @@ function SettingsUsersTab({ userRole, currentUserId }){
                   <td style={styles.td}>
                     <div style={{display:'flex',gap:4}}>
                       <button onClick={()=>openEdit(u)} style={styles.iconBtn} title="Editar"><Icon name="edit" size={18} color="#3b82f6"/></button>
-                      <button onClick={()=>regeneratePassword(u)} style={styles.iconBtn} title="Regenerar contraseña y enviarla por correo"><Icon name="lock_reset" size={18} color="#f59e0b"/></button>
+                      {/* Solo el administrador general: el backend exige requireSuperAdmin. */}
+                      {userRole==='admin'&&<button onClick={()=>regeneratePassword(u)} style={styles.iconBtn} title="Restablecer contraseña (se envía solo al correo del titular)"><Icon name="lock_reset" size={18} color="#f59e0b"/></button>}
                       <button onClick={()=>toggleUser(u)} style={styles.iconBtn} title={u.is_active?'Desactivar':'Activar'}><Icon name={u.is_active?'person_off':'person'} size={18} color={u.is_active?'#ef4444':'#22c55e'}/></button>
                     </div>
                   </td>

@@ -4,7 +4,7 @@ import { all, get, run } from '../db.js';
 import { requireAuth, requireAdmin, requireSuperAdmin, signToken } from '../middleware/auth.js';
 import { testConnection } from '../services/gemini.js';
 import { syncAllInboxes, getNoreplyConfig, sendNoreplyTest, sendSystemMail } from '../services/email.js';
-import { verifyChain } from '../services/audit.js';
+import { verifyChain, auditFromReq } from '../services/audit.js';
 import { encryptField, decryptEmbedded } from '../services/fieldCrypto.js';
 
 const router = Router();
@@ -107,18 +107,20 @@ router.get('/users', async (_req, res) => {
   res.json({ success: true, data: users });
 });
 
-/* El admin crea la cuenta con una CLAVE TEMPORAL: el usuario está obligado
-   a cambiarla en su primer ingreso (must_change_password=1). */
+/* El admin crea la cuenta pero NO elige la clave: la genera el servidor y el
+   usuario está obligado a cambiarla en su primer ingreso (must_change_password=1).
+   Ver la nota de seguridad sobre credenciales en /users/:id/regenerate-password. */
 router.post('/users', async (req, res) => {
-  const { name, document_type, document_number, email, phone, position, password, role, unit_id } = req.body || {};
-  if (!name || !document_number || !password) {
-    return res.status(400).json({ success: false, message: 'Nombre, documento y contraseña temporal son requeridos' });
+  const { name, document_type, document_number, email, phone, position, role, unit_id } = req.body || {};
+  if (!name || !document_number) {
+    return res.status(400).json({ success: false, message: 'Nombre y documento son requeridos' });
   }
-  if (password.length < 8) {
-    return res.status(400).json({ success: false, message: 'La contraseña temporal debe tener al menos 8 caracteres' });
+  if (req.body?.password) {
+    return res.status(400).json({ success: false, message: 'La clave temporal la genera el sistema; no puede fijarse desde el panel' });
   }
   const ex = await get('SELECT id FROM users WHERE document_number=?', [document_number]);
   if (ex) return res.status(409).json({ success: false, message: 'Este documento ya está registrado' });
+  const password = genTempPassword();
   const hash = await bcrypt.hash(password, 10);
   const r = await run(`INSERT INTO users(name,document_type,document_number,email,phone,position,password_hash,role,unit_id,is_active,must_change_password)
     VALUES(?,?,?,?,?,?,?,?,?,1,1)`,
@@ -142,22 +144,30 @@ router.post('/users', async (req, res) => {
   } else {
     message = 'El usuario no tiene correo; entregue la clave manualmente.';
   }
-  res.json({ success: true, id: r.lastID, must_change_password: true, emailed, email: email || '', message });
+  /* La clave solo vuelve al panel cuando NO pudo llegar al titular por correo.
+     Es aceptable únicamente aquí: la cuenta acaba de nacer y todavía no tiene
+     buzón configurado, así que no hay correspondencia que proteger — y sin este
+     canal la cuenta quedaría inaccesible. En el reseteo (cuenta ya en uso) la
+     clave NUNCA se devuelve. */
+  res.json({
+    success: true, id: r.lastID, must_change_password: true, emailed, email: email || '',
+    temp_password: emailed ? undefined : password, message,
+  });
 });
 
+/* Edición de datos del usuario. NO toca credenciales: fijar aquí una contraseña
+   le daría al admin una credencial válida del titular y, con ella, acceso a su
+   correo interno ya descifrado por la aplicación. El único camino de reseteo es
+   /users/:id/regenerate-password. */
 router.put('/users/:id', async (req, res) => {
-  const { name, email, phone, position, role, unit_id, is_active, password } = req.body || {};
+  const { name, email, phone, position, role, unit_id, is_active } = req.body || {};
   if (!name) return res.status(400).json({ success: false, message: 'Nombre requerido' });
-  const active = is_active !== undefined ? (is_active ? 1 : 0) : 1;
-  if (password && password.length >= 8) {
-    /* Reseteo de clave por el admin → vuelve a ser temporal */
-    const hash = await bcrypt.hash(password, 10);
-    await run('UPDATE users SET name=?,email=?,phone=?,position=?,role=?,unit_id=?,is_active=?,password_hash=?,must_change_password=1 WHERE id=?',
-      [name, encryptField(email || ''), phone || '', position || '', role || 'solicitante', unit_id || null, active, hash, req.params.id]);
-  } else {
-    await run('UPDATE users SET name=?,email=?,phone=?,position=?,role=?,unit_id=?,is_active=? WHERE id=?',
-      [name, encryptField(email || ''), phone || '', position || '', role || 'solicitante', unit_id || null, active, req.params.id]);
+  if (req.body?.password) {
+    return res.status(400).json({ success: false, message: 'Este formulario no cambia contraseñas. Use "Restablecer contraseña": la clave se envía solo al correo del titular.' });
   }
+  const active = is_active !== undefined ? (is_active ? 1 : 0) : 1;
+  await run('UPDATE users SET name=?,email=?,phone=?,position=?,role=?,unit_id=?,is_active=? WHERE id=?',
+    [name, encryptField(email || ''), phone || '', position || '', role || 'solicitante', unit_id || null, active, req.params.id]);
   res.json({ success: true });
 });
 
@@ -169,34 +179,75 @@ router.delete('/users/:id', async (req, res) => {
   res.json({ success: true });
 });
 
-/* ── Regenerar la clave temporal de un usuario y enviársela por el correo no-reply ── */
-router.post('/users/:id/regenerate-password', async (req, res) => {
+/* ── Restablecer la contraseña de un usuario ─────────────────────────────────
+   Solo el administrador general (requireSuperAdmin).
+
+   La clave nueva viaja ÚNICAMENTE al buzón del titular: no se devuelve al panel
+   ni se escribe en la bitácora. El motivo es el control de confidencialidad del
+   correo interno — quien conozca una credencial válida puede iniciar sesión como
+   el usuario y leer su correspondencia ya descifrada, que es justo lo que el
+   cifrado en reposo protege. Por eso tampoco existe impersonación (ver arriba).
+
+   Excepción acotada: si el usuario no tiene correo de contacto NI buzón
+   configurado no hay correspondencia que proteger y la entrega en mano es el
+   único canal posible; ahí sí se devuelve, y el evento queda marcado como tal
+   en la bitácora. */
+router.post('/users/:id/regenerate-password', requireSuperAdmin, async (req, res) => {
   const user = await get('SELECT id, name, email FROM users WHERE id=?', [req.params.id]);
   if (!user) return res.status(404).json({ success: false, message: 'Usuario no encontrado' });
 
+  const mailbox = await get('SELECT id FROM user_email_config WHERE user_id=?', [req.params.id]);
+
+  if (!user.email && mailbox) {
+    return res.status(409).json({
+      success: false,
+      message: 'Este usuario tiene un buzón configurado pero no tiene correo de contacto registrado. Regístrele un correo antes de restablecer la clave: entregarla en mano daría acceso a su bandeja.',
+    });
+  }
+
   const tempPassword = genTempPassword();
+
+  /* Sin correo y sin buzón: nada que proteger, entrega manual. */
+  if (!user.email) {
+    const hash = await bcrypt.hash(tempPassword, 10);
+    await run('UPDATE users SET password_hash=?, must_change_password=1 WHERE id=?', [hash, req.params.id]);
+    auditFromReq(req, 'Restablecer contraseña (entrega manual)', {
+      entity: 'admin/users', entityId: String(req.params.id),
+      details: { usuario_afectado: user.name, entrega: 'manual', motivo: 'sin correo de contacto ni buzón configurado' },
+    });
+    return res.json({
+      success: true, emailed: false, email: '', temp_password: tempPassword,
+      message: 'El usuario no tiene correo ni buzón; entregue la clave manualmente.',
+    });
+  }
+
+  /* Se envía ANTES de persistir el hash: si el correo falla, el usuario conserva
+     su clave actual en lugar de quedar bloqueado con una que nadie conoce. */
+  try {
+    await sendSystemMail({
+      to: user.email,
+      subject: 'Restablecimiento de contraseña — PGR Compras Públicas',
+      text: passwordEmailText(user.name, tempPassword),
+      html: passwordEmailHtml(user.name, tempPassword),
+    });
+  } catch (err) {
+    return res.status(502).json({
+      success: false,
+      message: `No se pudo enviar la clave a ${user.email}: ${err.message}. La contraseña NO fue modificada; revise la configuración del correo no-reply y reintente.`,
+    });
+  }
+
   const hash = await bcrypt.hash(tempPassword, 10);
   await run('UPDATE users SET password_hash=?, must_change_password=1 WHERE id=?', [hash, req.params.id]);
+  auditFromReq(req, 'Restablecer contraseña (enviada al titular)', {
+    entity: 'admin/users', entityId: String(req.params.id),
+    details: { usuario_afectado: user.name, entrega: 'correo del titular' },
+  });
 
-  let emailed = false, message = '';
-  if (!user.email) {
-    message = 'El usuario no tiene correo registrado; entregue la clave manualmente.';
-  } else {
-    try {
-      await sendSystemMail({
-        to: user.email,
-        subject: 'Restablecimiento de contraseña — PGR Compras Públicas',
-        text: passwordEmailText(user.name, tempPassword),
-        html: passwordEmailHtml(user.name, tempPassword),
-      });
-      emailed = true;
-      message = `Clave temporal enviada a ${user.email}.`;
-    } catch (err) {
-      message = `Clave regenerada, pero no se pudo enviar el correo: ${err.message}`;
-    }
-  }
-  // La clave se devuelve al admin como respaldo; nunca queda en la bitácora (el body de la petición está vacío).
-  res.json({ success: true, emailed, email: user.email || '', temp_password: tempPassword, message });
+  res.json({
+    success: true, emailed: true, email: user.email,
+    message: `Clave temporal enviada a ${user.email}. Por seguridad no se muestra aquí.`,
+  });
 });
 
 /* ── Escaneo manual de vencimientos (genera alertas + análisis IA) ── */
