@@ -109,6 +109,13 @@ const MAX_DOWNLOAD_BYTES = 150 * 1024 * 1024;
    lo que cualquier servidor IMAP mantiene viva una sesión. */
 const AI_CONCURRENCY = 4;
 
+/* Un buzón, UNA sincronización a la vez. El botón "Sincronizar" de la bandeja y
+   el programador automático llaman a syncInbox por su cuenta; sin este candado
+   ambos leían la MISMA lista de UID pendientes al arrancar y terminaban
+   insertando los mismos correos dos veces. */
+const inFlight = new Set();
+export const SYNC_IN_PROGRESS = 'SYNC_IN_PROGRESS';
+
 /** Ejecuta `fn` sobre `items` con como máximo `n` en vuelo, conservando el orden del resultado. */
 async function mapWithConcurrency(items, n, fn) {
   const out = new Array(items.length);
@@ -138,6 +145,20 @@ async function mapWithConcurrency(items, n, fn) {
  * completo sin importar nada.
  */
 export async function syncInbox(userId, { limit = 0 } = {}) {
+  if (inFlight.has(userId)) {
+    const err = new Error('Ya hay una sincronización en curso para este buzón; espere a que termine.');
+    err.code = SYNC_IN_PROGRESS;
+    throw err;
+  }
+  inFlight.add(userId);
+  try {
+    return await syncInboxLocked(userId, limit);
+  } finally {
+    inFlight.delete(userId);
+  }
+}
+
+async function syncInboxLocked(userId, limit) {
   const cfg = await get('SELECT * FROM user_email_config WHERE user_id=? AND is_active=1', [userId]);
   if (!cfg) throw new Error('No hay configuración de correo activa. Configure y active su cuenta primero.');
   if (!cfg.imap_host) throw new Error('Servidor IMAP no configurado.');
@@ -168,11 +189,19 @@ export async function syncInbox(userId, { limit = 0 } = {}) {
       // 2) Listar TODOS los UID del buzón (barato: solo UID, sin descargar cuerpos).
       const allUids = [];
       for await (const m of client.fetch('1:*', { uid: true })) allUids.push(m.uid);
-      allUids.sort((a, b) => a - b); // cronológico: primero los más antiguos (backfill del histórico).
+      /* MÁS RECIENTES PRIMERO. El UID de IMAP crece con cada mensaje que llega,
+         así que orden descendente = correo nuevo primero, histórico después.
+         Con el orden ascendente (backfill puro) un buzón de miles de mensajes
+         tardaba días en llegar a lo reciente: la bandeja se llenaba de correos
+         de hace tres años y el usuario no veía NUNCA lo que acababa de recibir,
+         que es justo lo que se muestra en la página 1 (ORDER BY created_at DESC). */
+      allUids.sort((a, b) => b - a);
 
       // 3) Pendientes = los que aún no están en la base.
       const pendingUids = allUids.filter(uid => !existing.has(`${cfg.email_address}:${uid}`));
       skipped = allUids.length - pendingUids.length;
+      /* El lote se toma —y se descarga— por el extremo más reciente: si se
+         alcanza el tope de bytes, lo que se queda fuera es lo más antiguo. */
       const toDownload = pendingUids.slice(0, perRun);
 
       // 4) Bajar el lote a memoria lo más rápido posible; el tope de bytes evita
@@ -199,6 +228,8 @@ export async function syncInbox(userId, { limit = 0 } = {}) {
   }
 
   /* ── Fase 2: parseo + clasificación IA + inserción (sin conexión IMAP) ── */
+  // Ya descargado, se vuelve al orden cronológico para insertar en serie.
+  downloaded.sort((a, b) => a.uid - b.uid);
   const SUB_BATCH = 8; // acota cuántos mensajes parseados coexisten en memoria
   for (let i = 0; i < downloaded.length; i += SUB_BATCH) {
     const slice = downloaded.slice(i, i + SUB_BATCH);
@@ -227,12 +258,24 @@ export async function syncInbox(userId, { limit = 0 } = {}) {
 
     // Las inserciones van en serie y en orden cronológico (UID ascendente).
     for (const p of prepared) {
+      let r;
+      try {
+        r = await run(`INSERT INTO correspondences(subject,body,from_user_id,to_user_id,label,external_from,imap_uid,ai_category,ai_priority,ai_summary,created_at)
+          VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
+          [p.subject, p.body, null, userId, 'inbox', encryptField(p.fromText), `${cfg.email_address}:${p.uid}`,
+           p.ai?.category || '', p.ai?.priority || '', p.ai?.summary || '',
+           p.date ? p.date.toISOString().slice(0, 19).replace('T', ' ') : null]);
+      } catch (err) {
+        /* Clave duplicada (2601/2627 en el índice único de imap_uid): el correo
+           ya está importado. Red de seguridad por si el candado no alcanza —
+           p. ej. dos procesos del servicio tras un reinicio. No es un fallo. */
+        if (err.number === 2601 || err.number === 2627 || /duplicate key/i.test(err.message || '')) {
+          skipped++;
+          continue;
+        }
+        throw err;
+      }
       if (p.ai) classified++;
-      const r = await run(`INSERT INTO correspondences(subject,body,from_user_id,to_user_id,label,external_from,imap_uid,ai_category,ai_priority,ai_summary,created_at)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
-        [p.subject, p.body, null, userId, 'inbox', encryptField(p.fromText), `${cfg.email_address}:${p.uid}`,
-         p.ai?.category || '', p.ai?.priority || '', p.ai?.summary || '',
-         p.date ? p.date.toISOString().slice(0, 19).replace('T', ' ') : null]);
 
       /* Guardar adjuntos en disco y registrarlos */
       for (const a of p.attachments) {
@@ -296,6 +339,12 @@ export async function syncAllInboxes({ limit = 0 } = {}) {
       const r = await syncInbox(cfg.user_id, { limit });
       results.push({ user_id: cfg.user_id, user_name: cfg.user_name, email: cfg.email_address, ok: true, ...r });
     } catch (err) {
+      /* El usuario está sincronizando a mano en este momento: se omite el buzón
+         en este ciclo y se retoma en el siguiente. No es un error. */
+      if (err.code === SYNC_IN_PROGRESS) {
+        results.push({ user_id: cfg.user_id, user_name: cfg.user_name, email: cfg.email_address, ok: true, skipped_run: true, imported: 0, classified: 0 });
+        continue;
+      }
       results.push({ user_id: cfg.user_id, user_name: cfg.user_name, email: cfg.email_address, ok: false, message: err.responseText || err.message });
     }
   }
